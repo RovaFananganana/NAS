@@ -1,45 +1,41 @@
 from flask import Blueprint, request, jsonify
 from models.user import User
 from extensions import db
-from flask_jwt_extended import create_access_token
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt 
 
 
 
 auth_bp = Blueprint("auth", __name__)
 
-# Créer un utilisateur
-@auth_bp.route("/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    if data is None:
-     return {"error": "No JSON received"}, 400
-
-    username = data.get("username")
-    email = data.get("email")
-    password = data.get("password")
-
-    if User.query.filter((User.username==username)|(User.email==email)).first():
-        return jsonify({"msg": "Utilisateur déjà existant"}), 400
-
-    user = User(username=username, email=email)
-    user.set_password(password)  # hash le mot de passe
-    db.session.add(user)
-    db.session.commit()
-
-    return jsonify({"msg": "Utilisateur enregistré avec succès", "user_id": user.id}), 201
-
 # Connexion
 @auth_bp.route("/login", methods=["POST"])
 def login():
-    data = request.get_json
+    data = request.get_json(silent=True)
+    print("DEBUG data:", data) 
+   
+    if not isinstance(data, dict):
+     if request.form:
+        data = request.form.to_dict()
+     elif request.args:
+        data = request.args.to_dict()
+     else:
+        return jsonify({"error": "Payload JSON attendu (objet)"}), 400
+
     username = data.get("username")
     password = data.get("password")
+    print("DEBUG username:", username)
+    print("DEBUG password:", password)
+
 
     user = User.query.filter_by(username=username).first()
-    if not user or not User.check_password(password):
+    print("DEBUG user:", user)
+    if not user or not user.check_password(password):
         return jsonify({"msg": "Nom d'utilisateur ou mot de passe incorrect"}), 401
 
-    access_token = create_access_token(identity=user.id)
+    access_token = create_access_token(
+       identity=user.id,
+       additional_claims={'role': user.role}
+       )
     return jsonify({
         "msg": "Connexion réussie",
         "access_token": access_token,
