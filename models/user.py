@@ -12,7 +12,7 @@ class User(db.Model):
     username = db.Column(db.String(50), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=True)
     password_hash = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(20), default="SIMPLE_USER", nullable=False)
+    role = db.Column(db.String(20), default="user", nullable=False)
     quota_mb = db.Column(db.Integer, default=2054)
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
 

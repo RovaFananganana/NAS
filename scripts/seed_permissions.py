@@ -19,7 +19,7 @@ def seed_permissions():
             for resource in resources:
                 for action in actions:
                     # Pour SIMPLE_USER, limiter certaines actions sur "user"
-                    if role == "SIMPLE_USER" and resource == "user" and action != "READ":
+                    if role == "user" and resource == "user" and action != "READ":
                         continue
                     perm = Permission(role=role, resource=resource, action=action)
                     permissions.append(perm)

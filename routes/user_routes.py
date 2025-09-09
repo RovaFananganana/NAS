@@ -237,7 +237,12 @@ def get_my_files():
     query = File.query.filter_by(owner_id=user_id)
     
     if folder_id is not None:
+        try:
+         folder_id = int(folder_id)
+        except ValueError:
+            return jsonify({"error": "folder_id doit être un entier"}), 422
         query = query.filter_by(folder_id=folder_id)
+        
     elif request.args.get('root_only') == 'true':
         query = query.filter_by(folder_id=None)
     

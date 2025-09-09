@@ -21,7 +21,7 @@ def admin_required(f):
         current_user_id = get_jwt_identity()
         claims = get_jwt()
         
-        if claims.get('role') != 'ADMIN':
+        if claims.get('role') != 'admin':
             return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
             
         return f(*args, **kwargs)

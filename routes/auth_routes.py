@@ -23,27 +23,30 @@ def login():
 
     username = data.get("username")
     password = data.get("password")
+    role = data.get("role")
     print("DEBUG username:", username)
     print("DEBUG password:", password)
+    print("DEBUG role:", role)
 
 
     user = User.query.filter_by(username=username).first()
     print("DEBUG user:", user)
-    if not user or not user.check_password(password):
-        return jsonify({"msg": "Nom d'utilisateur ou mot de passe incorrect"}), 401
-
-    access_token = create_access_token(
-       identity=user.id,
-       additional_claims={'role': user.role}
-       )
-    return jsonify({
-        "msg": "Connexion réussie",
-        "access_token": access_token,
-        "user": {
-            "id": user.id,
-            "username": user.username,
-            "email": user.email,
-            "role": user.role
-        }
-    }), 200
+    if user and user.check_password(password):
+        # Ajouter le rôle dans le token JWT
+        additional_claims = {"role": user.role}
+        access_token = create_access_token(
+            identity=str(user.id),  # ⚠️ bien mettre en string
+            additional_claims=additional_claims
+        )
+        return jsonify({
+            "access_token": access_token,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "role": user.role
+            }
+        }), 200
+    else:
+        return jsonify({"msg": "Invalid credentials"}), 401
 
