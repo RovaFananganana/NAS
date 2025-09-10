@@ -17,9 +17,9 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
 
     # Relations
-    files = db.relationship("File", backref="owner", lazy=True)
-    folders = db.relationship("Folder", backref="owner", lazy=True)
-    access_logs = db.relationship("AccessLog", backref="user", lazy=True)
+    files = db.relationship("File", backref="owner", lazy=True, cascade="all, delete-orphan")
+    folders = db.relationship("Folder", backref="owner", lazy=True, cascade="all, delete-orphan")
+    access_logs = db.relationship("AccessLog", backref="user", lazy=True, cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<User {self.username}>"

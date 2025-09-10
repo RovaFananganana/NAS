@@ -11,6 +11,7 @@ from extensions import db
 from functools import wraps
 import os
 from datetime import datetime, timezone
+from werkzeug.security import generate_password_hash
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
@@ -60,45 +61,42 @@ def get_all_users():
     return jsonify(users_data), 200
 
 @admin_bp.route('/users', methods=['POST'])
-@admin_required
 def create_user():
-    """Créer un nouvel utilisateur"""
-    data = request.get_json()
-    
-    if not data or not data.get('username') or not data.get('password'):
-        return jsonify({"msg": "Username et password requis"}), 400
-    
-    # Vérifier si l'utilisateur existe déjà
-    if User.query.filter_by(username=data['username']).first():
-        return jsonify({"msg": "Cet utilisateur existe déjà"}), 409
-    
-    if data.get('email') and User.query.filter_by(email=data['email']).first():
-        return jsonify({"msg": "Cet email est déjà utilisé"}), 409
-    
-    user = User(
-        username=data['username'],
-        email=data.get('email'),
-        role=data.get('role', 'SIMPLE_USER'),
-        quota_mb=data.get('quota_mb', 2048)
-    )
-    user.set_password(data['password'])
-    
     try:
+        data = request.get_json()
+        print("Données reçues:", data)
+
+        username = data.get("username")
+        email = data.get("email")
+        password = data.get("password")
+        role = data.get("role", "user")
+
+        if not username or not password:
+            import traceback
+            traceback.print_exc() 
+            return jsonify({"error": "Missing required fields"}), 400
+
+        # Vérifier si utilisateur existe déjà
+        query = User.query.filter(User.username == username)
+        if email:
+            query = query.union(User.query.filter(User.email == email))
+
+        existing = query.first()
+        if existing:
+            return jsonify({"error": "User already exists"}), 400
+
+        # Créer l’utilisateur
+        user = User(username=username, email=email, role=role)
+        user.set_password(password)
         db.session.add(user)
         db.session.commit()
-        log_admin_action('CREATE_USER', f"user:{user.username}")
-        return jsonify({
-            "msg": "Utilisateur créé avec succès",
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "role": user.role
-            }
-        }), 201
+
+        return jsonify({"message": "Utilisateur créé avec succès"}), 201
+
     except Exception as e:
-        db.session.rollback()
-        return jsonify({"msg": "Erreur lors de la création"}), 500
+        import traceback
+        traceback.print_exc()  # log complet dans la console
+        return jsonify({"error": str(e)}), 500
 
 @admin_bp.route('/users/<int:user_id>', methods=['PUT'])
 @admin_required
@@ -134,21 +132,27 @@ def update_user(user_id):
         db.session.rollback()
         return jsonify({"msg": "Erreur lors de la modification"}), 500
 
-@admin_bp.route('/users/<int:user_id>', methods=['DELETE'])
-@admin_required
+@admin_bp.route("/users/<int:user_id>", methods=["DELETE"])
+@jwt_required()
 def delete_user(user_id):
-    """Supprimer un utilisateur"""
-    user = User.query.get_or_404(user_id)
-    username = user.username
+    current_user_id = get_jwt_identity()
+    user = User.query.get(user_id)
     
+    if not user:
+        return jsonify({"msg": "Utilisateur introuvable"}), 404
+
+    # Optionnel : empêche la suppression de l'admin connecté
+    if user.id == current_user_id:
+        return jsonify({"msg": "Impossible de supprimer votre propre compte"}), 400
+
     try:
         db.session.delete(user)
         db.session.commit()
-        log_admin_action('DELETE_USER', f"user:{username}")
         return jsonify({"msg": "Utilisateur supprimé avec succès"}), 200
     except Exception as e:
         db.session.rollback()
-        return jsonify({"msg": "Erreur lors de la suppression"}), 500
+        print("Erreur suppression user:", e)  # <-- ça te donnera le détail
+        return jsonify({"msg": "Erreur interne lors de la suppression"}), 500
 
 # ========== GESTION DES GROUPES ==========
 
