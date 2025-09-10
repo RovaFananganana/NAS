@@ -4,7 +4,7 @@ class RolePermission(db.Model):
     __tablename__ = "role_permissions"
 
     id = db.Column(db.Integer, primary_key=True)
-    role = db.Column(db.String(20), nullable=False)  # ADMIN, MANAGER, SIMPLE_USER
+    role = db.Column(db.String(20), nullable=False)  # ADMIN, SIMPLE_USER
     permission_id = db.Column(db.Integer, db.ForeignKey("permissions.id"), nullable=False)
 
     # Relation avec Permission

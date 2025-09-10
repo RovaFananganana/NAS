@@ -13,7 +13,7 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=True)
     password_hash = db.Column(db.String(255), nullable=False)
     role = db.Column(db.String(20), default="user", nullable=False)
-    quota_mb = db.Column(db.Integer, default=2054)
+    quota_mb = db.Column(db.Integer, default=2048)
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
 
     # Relations
@@ -21,15 +21,17 @@ class User(db.Model):
     folders = db.relationship("Folder", backref="owner", lazy=True, cascade="all, delete-orphan")
     access_logs = db.relationship("AccessLog", backref="user", lazy=True, cascade="all, delete-orphan")
 
+    # Permissions
+    file_permissions = db.relationship("FilePermission", back_populates="user", cascade="all, delete-orphan")
+    folder_permissions = db.relationship("FolderPermission", back_populates="user", cascade="all, delete-orphan")
+
     def __repr__(self):
         return f"<User {self.username}>"
-    
+
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
         return self.password_hash
 
     def check_password(self, password: str) -> bool:
-        print(password, self.password_hash)
         return check_password_hash(self.password_hash, password)
-    
  

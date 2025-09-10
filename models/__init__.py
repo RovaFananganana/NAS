@@ -6,6 +6,8 @@ from .permission import Permission
 from .access_log import AccessLog
 from .quota import Quota
 from .role_permission import RolePermission
+from .file_permission import FilePermission
+from .folder_permission import FolderPermission
 
 __all__ = [
     "User",
@@ -15,4 +17,6 @@ __all__ = [
     "Permission",
     "AccessLog",
     "Quota",
-    "RolePermission",]
+    "RolePermission",
+    "FilePermission",
+    "FolderPermission",]

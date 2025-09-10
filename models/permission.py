@@ -9,6 +9,7 @@ class Permission(db.Model):
 
     # Relation pivot
     roles = db.relationship("RolePermission", back_populates="permission", cascade="all, delete-orphan")
-
+    
     def __repr__(self):
         return f"<Permission {self.action} on {self.resource}>"
+
