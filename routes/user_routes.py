@@ -9,6 +9,8 @@ from models.access_log import AccessLog
 from extensions import db
 from functools import wraps
 from datetime import datetime, timezone
+from utils.permission_middleware import require_resource_permission, get_user_accessible_resources, check_user_can_access_resource
+from models.file_permission import FilePermission
 
 user_bp = Blueprint('user_bp', __name__, url_prefix='/users')
 
@@ -413,3 +415,224 @@ def get_dashboard():
         'recent_files': recent_files_data,
         'recent_activity': recent_activity
     }), 200
+
+@user_bp.route('/accessible-resources', methods=['GET'])
+@jwt_required()
+def get_accessible_resources():
+    """Récupère toutes les ressources accessibles par l'utilisateur connecté"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    
+    if not user:
+        return jsonify({"msg": "Utilisateur non trouvé"}), 404
+    
+    resource_type = request.args.get('type', 'both')  # files, folders, both
+    accessible = get_user_accessible_resources(user, resource_type)
+    
+    # Formater les données de retour
+    files_data = []
+    for file in accessible['files']:
+        permission = file.get_effective_permissions(user)
+        files_data.append({
+            'id': file.id,
+            'name': file.name,
+            'path': file.path,
+            'size_kb': file.size_kb,
+            'owner': file.owner.username,
+            'folder_name': file.folder.name if file.folder else 'Racine',
+            'created_at': file.created_at.isoformat(),
+            'is_owner': file.owner_id == user.id,
+            'permissions': {
+                'can_read': permission.can_read if permission else True,
+                'can_write': permission.can_write if permission else (file.owner_id == user.id),
+                'can_delete': permission.can_delete if permission else (file.owner_id == user.id),
+                'can_share': permission.can_share if permission else (file.owner_id == user.id),
+                'source': 'owner' if file.owner_id == user.id else ('user' if permission and permission.user_id else 'group')
+            } if permission or file.owner_id == user.id else None
+        })
+    
+    folders_data = []
+    for folder in accessible['folders']:
+        permission = folder.get_effective_permissions(user)
+        folders_data.append({
+            'id': folder.id,
+            'name': folder.name,
+            'owner': folder.owner.username,
+            'parent_id': folder.parent_id,
+            'created_at': folder.created_at.isoformat(),
+            'is_owner': folder.owner_id == user.id,
+            'children_count': len(folder.children),
+            'files_count': len(folder.files),
+            'permissions': {
+                'can_read': permission.can_read if permission else True,
+                'can_write': permission.can_write if permission else (folder.owner_id == user.id),
+                'can_delete': permission.can_delete if permission else (folder.owner_id == user.id),
+                'can_share': permission.can_share if permission else (folder.owner_id == user.id),
+                'source': 'owner' if folder.owner_id == user.id else ('user' if permission and permission.user_id else 'group')
+            } if permission or folder.owner_id == user.id else None
+        })
+    
+    log_user_action('READ', 'accessible_resources')
+    return jsonify({
+        'files': files_data,
+        'folders': folders_data,
+        'stats': {
+            'total_files': len(files_data),
+            'total_folders': len(folders_data),
+            'owned_files': len([f for f in files_data if f['is_owner']]),
+            'owned_folders': len([f for f in folders_data if f['is_owner']]),
+            'shared_files': len([f for f in files_data if not f['is_owner']]),
+            'shared_folders': len([f for f in folders_data if not f['is_owner']])
+        }
+    }), 200
+
+@user_bp.route('/folders/<int:folder_id>/content', methods=['GET'])
+@require_resource_permission('folder', 'read')
+def get_folder_content(folder_id):
+    """Récupère le contenu d'un dossier (sous-dossiers et fichiers)"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    folder = Folder.query.get_or_404(folder_id)
+    
+    # Récupérer les sous-dossiers accessibles
+    subfolders = []
+    for subfolder in folder.children:
+        if check_user_can_access_resource(user, subfolder, 'read'):
+            permission = subfolder.get_effective_permissions(user)
+            subfolders.append({
+                'id': subfolder.id,
+                'name': subfolder.name,
+                'owner': subfolder.owner.username,
+                'created_at': subfolder.created_at.isoformat(),
+                'is_owner': subfolder.owner_id == user.id,
+                'children_count': len(subfolder.children),
+                'files_count': len(subfolder.files),
+                'permissions': {
+                    'can_read': permission.can_read if permission else True,
+                    'can_write': permission.can_write if permission else (subfolder.owner_id == user.id),
+                    'can_delete': permission.can_delete if permission else (subfolder.owner_id == user.id),
+                    'can_share': permission.can_share if permission else (subfolder.owner_id == user.id)
+                } if permission or subfolder.owner_id == user.id else None
+            })
+    
+    # Récupérer les fichiers accessibles
+    files = []
+    for file in folder.files:
+        if check_user_can_access_resource(user, file, 'read'):
+            permission = file.get_effective_permissions(user)
+            files.append({
+                'id': file.id,
+                'name': file.name,
+                'path': file.path,
+                'size_kb': file.size_kb,
+                'size_mb': round(file.size_kb / 1024, 2),
+                'owner': file.owner.username,
+                'created_at': file.created_at.isoformat(),
+                'is_owner': file.owner_id == user.id,
+                'permissions': {
+                    'can_read': permission.can_read if permission else True,
+                    'can_write': permission.can_write if permission else (file.owner_id == user.id),
+                    'can_delete': permission.can_delete if permission else (file.owner_id == user.id),
+                    'can_share': permission.can_share if permission else (file.owner_id == user.id)
+                } if permission or file.owner_id == user.id else None
+            })
+    
+    log_user_action('READ', f"folder_content:{folder.name}")
+    return jsonify({
+        'folder': {
+            'id': folder.id,
+            'name': folder.name,
+            'owner': folder.owner.username,
+            'parent_id': folder.parent_id,
+            'is_owner': folder.owner_id == user.id,
+            'path': get_folder_path(folder)  # Vous devrez implémenter cette fonction
+        },
+        'subfolders': subfolders,
+        'files': files,
+        'stats': {
+            'subfolders_count': len(subfolders),
+            'files_count': len(files),
+            'total_size_kb': sum(f['size_kb'] for f in files)
+        }
+    }), 200
+
+@user_bp.route('/files/<int:file_id>/download', methods=['GET'])
+@require_resource_permission('file', 'read')
+def download_file(file_id):
+    """Télécharge un fichier (placeholder)"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    file = File.query.get_or_404(file_id)
+    
+    log_user_action('DOWNLOAD', f"file:{file.name}")
+    
+    # Ici vous implémenteriez la logique de téléchargement
+    return jsonify({
+        "msg": "Téléchargement autorisé",
+        "file": {
+            "id": file.id,
+            "name": file.name,
+            "path": file.path,
+            "size_kb": file.size_kb
+        }
+    }), 200
+
+@user_bp.route('/files/<int:file_id>/share', methods=['POST'])
+@require_resource_permission('file', 'share')
+def share_file(file_id):
+    """Partage un fichier avec un utilisateur ou groupe"""
+    user_id = get_jwt_identity()
+    user = User.query.get(user_id)
+    file = File.query.get_or_404(file_id)
+    data = request.get_json()
+    
+    target_type = data.get('target_type')  # 'user' ou 'group'
+    target_id = data.get('target_id')
+    permissions = data.get('permissions', {})
+    
+    if not target_type or not target_id:
+        return jsonify({"msg": "Type et ID de destinataire requis"}), 400
+    
+    try:
+        if target_type == 'user':
+            target_user = User.query.get_or_404(target_id)
+            # Vérifier si le partage existe déjà 
+            existing = file.shared_with_users.filter_by(user_id=target_user.id).first()
+            if existing:    
+                return jsonify({"msg": "Le fichier est déjà partagé avec cet utilisateur"}), 409
+            file.shared_with_users.append(target_user)
+            db.session.flush()  # Pour obtenir l'ID de la relation
+            file_perm = FilePermission(
+                file_id=file.id,
+                user_id=target_user.id,
+                can_read=permissions.get('can_read', True),
+                can_write=permissions.get('can_write', False),
+                can_delete=permissions.get('can_delete', False),
+                can_share=permissions.get('can_share', False)
+            )
+            db.session.add(file_perm)
+        elif target_type == 'group':
+            target_group = Group.query.get_or_404(target_id)
+            # Vérifier si le partage existe déjà 
+            existing = file.shared_with_groups.filter_by(group_id=target_group.id).first()
+            if existing:    
+                return jsonify({"msg": "Le fichier est déjà partagé avec ce groupe"}), 409
+            file.shared_with_groups.append(target_group)
+            db.session.flush()  # Pour obtenir l'ID de la relation
+            file_perm = FilePermission(
+                file_id=file.id,
+                group_id=target_group.id,
+                can_read=permissions.get('can_read', True),
+                can_write=permissions.get('can_write', False),
+                can_delete=permissions.get('can_delete', False),
+                can_share=permissions.get('can_share', False)
+            )
+            db.session.add(file_perm)
+        else:            
+            return jsonify({"msg": "Type de destinataire invalide"}), 400
+        db.session.commit()
+        log_user_action('SHARE', f"file:{file.name} with {target_type   }:{target_id}")
+        return jsonify({"msg": "Fichier partagé avec succès"}), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": "Erreur lors du partage"}), 500            
