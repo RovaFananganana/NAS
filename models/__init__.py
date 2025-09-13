@@ -8,6 +8,7 @@ from .quota import Quota
 from .role_permission import RolePermission
 from .file_permission import FilePermission
 from .folder_permission import FolderPermission
+from .permission_cache import PermissionCache
 
 __all__ = [
     "User",
@@ -19,4 +20,5 @@ __all__ = [
     "Quota",
     "RolePermission",
     "FilePermission",
-    "FolderPermission",]
+    "FolderPermission",
+    "PermissionCache",]

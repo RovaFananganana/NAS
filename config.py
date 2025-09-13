@@ -24,3 +24,9 @@ class Config:
     JWT_HEADER_NAME = "Authorization"  
     JWT_HEADER_TYPE = "Bearer"
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=24)
+    
+    # Performance Monitoring Configuration
+    SLOW_QUERY_THRESHOLD_MS = float(os.getenv("SLOW_QUERY_THRESHOLD_MS", "100"))
+    PERMISSION_QUERY_THRESHOLD_MS = float(os.getenv("PERMISSION_QUERY_THRESHOLD_MS", "50"))
+    BULK_OPERATION_THRESHOLD_MS = float(os.getenv("BULK_OPERATION_THRESHOLD_MS", "200"))
+    ENABLE_PERFORMANCE_DEBUG = os.getenv("ENABLE_PERFORMANCE_DEBUG", "false").lower() == "true"
