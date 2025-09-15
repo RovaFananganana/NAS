@@ -7,6 +7,7 @@ from .admin_routes import admin_bp
 from .folder_routes import folder_bp
 from .permission_routes import permission_bp
 from .metrics_routes import metrics_bp
+from .performance import performance_bp
 
 def register_blueprints(app):
     app.register_blueprint(auth_bp, url_prefix="/auth")
@@ -16,3 +17,4 @@ def register_blueprints(app):
     app.register_blueprint(folder_bp, url_prefix="/folders")
     app.register_blueprint(permission_bp, url_prefix="/permissions")
     app.register_blueprint(metrics_bp, url_prefix="/metrics")
+    app.register_blueprint(performance_bp, url_prefix="/api")

@@ -2,6 +2,7 @@
 
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
+from datetime import datetime
 from models.user import User
 from models.group import Group
 from models.folder import Folder
@@ -31,29 +32,95 @@ def bool_from_payload(data, key):
     return bool(val) if val is not None else False
 
 # ===================== RESSOURCES =====================
-@permission_bp.route('/resources', methods=['GET'])
+@permission_bp.route('/test', methods=['GET', 'OPTIONS'])
+def test_endpoint():
+    """Simple test endpoint to verify CORS and basic functionality"""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    return jsonify({'status': 'ok', 'message': 'Permission API is working', 'timestamp': str(datetime.now())})
+
+@permission_bp.route('/resources', methods=['GET', 'OPTIONS'])
 def get_all_resources():
-    folders = Folder.query.all()
-    files = File.query.all()
+    try:
+        folders = Folder.query.all()
+        files = File.query.all()
+        users = User.query.all()
+        groups = Group.query.all()
 
-    # Pour chaque dossier/fichier, récupérer les permissions
-    folders_data = []
-    for f in folders:
-        folders_data.append({
-            'id': f.id,
-            'name': f.name,
-            'permissions': [{'id': p.id, 'type': p.type, 'target_id': p.target_id, 'target_name': p.target_name, **p.permissions_dict()} for p in f.permissions]
+        # Pour chaque dossier, récupérer les permissions
+        folders_data = []
+        for f in folders:
+            permissions_data = []
+            for p in f.permissions:
+                perm_data = {
+                    'id': p.id,
+                    'can_read': p.can_read,
+                    'can_write': p.can_write,
+                    'can_delete': p.can_delete,
+                    'can_share': p.can_share,
+                }
+                
+                if p.user_id:
+                    perm_data['type'] = 'user'
+                    perm_data['target_id'] = p.user_id
+                    perm_data['target_name'] = p.user.username if p.user else f'User {p.user_id}'
+                elif p.group_id:
+                    perm_data['type'] = 'group'
+                    perm_data['target_id'] = p.group_id
+                    perm_data['target_name'] = p.group.name if p.group else f'Group {p.group_id}'
+                
+                permissions_data.append(perm_data)
+            
+            folders_data.append({
+                'id': f.id,
+                'name': f.name,
+                'permissions': permissions_data
+            })
+
+        # Pour chaque fichier, récupérer les permissions
+        files_data = []
+        for file in files:
+            permissions_data = []
+            for p in file.permissions:
+                perm_data = {
+                    'id': p.id,
+                    'can_read': p.can_read,
+                    'can_write': p.can_write,
+                    'can_delete': p.can_delete,
+                    'can_share': p.can_share,
+                }
+                
+                if p.user_id:
+                    perm_data['type'] = 'user'
+                    perm_data['target_id'] = p.user_id
+                    perm_data['target_name'] = p.user.username if p.user else f'User {p.user_id}'
+                elif p.group_id:
+                    perm_data['type'] = 'group'
+                    perm_data['target_id'] = p.group_id
+                    perm_data['target_name'] = p.group.name if p.group else f'Group {p.group_id}'
+                
+                permissions_data.append(perm_data)
+            
+            files_data.append({
+                'id': file.id,
+                'name': file.name,
+                'permissions': permissions_data
+            })
+
+        # Ajouter les utilisateurs et groupes pour les dropdowns
+        users_data = [{'id': u.id, 'username': u.username} for u in users]
+        groups_data = [{'id': g.id, 'name': g.name} for g in groups]
+
+        return jsonify({
+            'folders': folders_data, 
+            'files': files_data,
+            'users': users_data,
+            'groups': groups_data
         })
-
-    files_data = []
-    for file in files:
-        files_data.append({
-            'id': file.id,
-            'name': file.name,
-            'permissions': [{'id': p.id, 'type': p.type, 'target_id': p.target_id, 'target_name': p.target_name, **p.permissions_dict()} for p in file.permissions]
-        })
-
-    return jsonify({'folders': folders_data, 'files': files_data})
+        
+    except Exception as e:
+        print(f"Error in get_all_resources: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 # ===================== DOSSIERS =====================
 
 @permission_bp.route('/folders/<int:folder_id>', methods=['GET'])
@@ -90,16 +157,30 @@ def set_permission(entity, target_type, target_id, data):
     """Fonction interne pour créer ou mettre à jour une permission"""
     if target_type == 'user':
         user = User.query.get_or_404(target_id)
-        perm = entity.permissions.filter_by(user_id=target_id).first()
-        if not perm:
-            perm = FolderPermission(folder_id=entity.id, user_id=target_id) if isinstance(entity, Folder) else FilePermission(file_id=entity.id, user_id=target_id)
-            db.session.add(perm)
+        # Fix: Use proper query instead of InstrumentedList filter_by
+        if isinstance(entity, Folder):
+            perm = FolderPermission.query.filter_by(folder_id=entity.id, user_id=target_id).first()
+            if not perm:
+                perm = FolderPermission(folder_id=entity.id, user_id=target_id)
+                db.session.add(perm)
+        else:
+            perm = FilePermission.query.filter_by(file_id=entity.id, user_id=target_id).first()
+            if not perm:
+                perm = FilePermission(file_id=entity.id, user_id=target_id)
+                db.session.add(perm)
     else:  # group
         group = Group.query.get_or_404(target_id)
-        perm = entity.permissions.filter_by(group_id=target_id).first()
-        if not perm:
-            perm = FolderPermission(folder_id=entity.id, group_id=target_id) if isinstance(entity, Folder) else FilePermission(file_id=entity.id, group_id=target_id)
-            db.session.add(perm)
+        # Fix: Use proper query instead of InstrumentedList filter_by
+        if isinstance(entity, Folder):
+            perm = FolderPermission.query.filter_by(folder_id=entity.id, group_id=target_id).first()
+            if not perm:
+                perm = FolderPermission(folder_id=entity.id, group_id=target_id)
+                db.session.add(perm)
+        else:
+            perm = FilePermission.query.filter_by(file_id=entity.id, group_id=target_id).first()
+            if not perm:
+                perm = FilePermission(file_id=entity.id, group_id=target_id)
+                db.session.add(perm)
 
     perm.can_read = bool_from_payload(data, 'can_read')
     perm.can_write = bool_from_payload(data, 'can_write')
@@ -108,16 +189,37 @@ def set_permission(entity, target_type, target_id, data):
 
     return perm
 
-@permission_bp.route('/folders/<int:folder_id>/<target_type>/<int:target_id>', methods=['POST'])
-@admin_required
+@permission_bp.route('/folders/<int:folder_id>/<target_type>/<int:target_id>', methods=['POST', 'OPTIONS'])
 def set_folder_permission(folder_id, target_type, target_id):
     """Définir/modifier permissions dossier (user ou group)"""
-    folder = Folder.query.get_or_404(folder_id)
-    data = request.get_json()
-    perm = set_permission(folder, target_type, target_id, data)
-
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
+    # Apply admin_required only for non-OPTIONS requests
+    from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
     try:
+        verify_jwt_in_request()
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user or user.role.upper() != 'ADMIN':
+            return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
+            
+    except Exception as e:
+        print(f"JWT verification error: {str(e)}")
+        return jsonify({"msg": "Token d'authentification requis"}), 401
+        
+    try:
+        folder = Folder.query.get_or_404(folder_id)
+        data = request.get_json() or {}
+        
+        # Validate target_type
+        if target_type not in ['user', 'group']:
+            return jsonify({"msg": "target_type doit être 'user' ou 'group'"}), 400
+        
+        perm = set_permission(folder, target_type, target_id, data)
         db.session.commit()
+        
         return jsonify({
             "msg": f"Permissions mises à jour pour {target_type} {target_id} sur le dossier {folder.name}",
             "permission": {
@@ -130,6 +232,7 @@ def set_folder_permission(folder_id, target_type, target_id):
         }), 200
     except Exception as e:
         db.session.rollback()
+        print(f"Error in set_folder_permission: {str(e)}")
         return jsonify({"msg": f"Erreur: {str(e)}"}), 500
 
 @permission_bp.route('/folders/<int:folder_id>/permissions/<int:permission_id>', methods=['DELETE'])
@@ -176,10 +279,21 @@ def get_file_permissions(file_id):
         'permissions': result
     }), 200
 
-@permission_bp.route('/files/<int:file_id>/<target_type>/<int:target_id>', methods=['POST'])
-@admin_required
+@permission_bp.route('/files/<int:file_id>/<target_type>/<int:target_id>', methods=['POST', 'OPTIONS'])
 def set_file_permission(file_id, target_type, target_id):
     """Définir/modifier permissions fichier (user ou group)"""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
+    # Apply admin_required only for non-OPTIONS requests
+    from flask_jwt_extended import verify_jwt_in_request
+    try:
+        verify_jwt_in_request()
+        claims = get_jwt()
+        if claims.get('role') != 'ADMIN':
+            return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
+    except Exception as e:
+        return jsonify({"msg": "Token d'authentification requis"}), 401
     file = File.query.get_or_404(file_id)
     data = request.get_json()
     perm = set_permission(file, target_type, target_id, data)
