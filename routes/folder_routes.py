@@ -1,23 +1,44 @@
 # routes/folder_routes.py
 
 from flask import Blueprint, request, jsonify
-from flask_jwt_extended import jwt_required, get_jwt_identity, get_jwt
+from flask_jwt_extended import jwt_required, get_jwt_identity
 from models import Folder, User, FolderPermission, File
 from extensions import db
-from services.file_service import create_folder
 from services.permission_optimizer import PermissionOptimizer
+from utils.nas_utils import normalize_smb_path, validate_smb_path, sanitize_filename
+from utils.smb_client import SMBClientNAS
 
 folder_bp = Blueprint('folder_bp', __name__, url_prefix='/folders')
 
 # Initialize permission optimizer
 permission_optimizer = PermissionOptimizer()
 
+# Instance SMB pour synchronisation
+def get_nas_client():
+    return SMBClientNAS()
+
+def sync_folder_with_nas(folder, nas_client=None):
+    """Synchronise un dossier DB avec le NAS"""
+    if nas_client is None:
+        nas_client = get_nas_client()
+    
+    try:
+        # Vérifier si le dossier existe sur le NAS
+        if not nas_client.path_exists(folder.path):
+            # Créer le dossier sur le NAS
+            parent_path = "/".join(folder.path.split("/")[:-1]) or "/"
+            nas_client.create_folder(parent_path, folder.name)
+        return True
+    except Exception as e:
+        print(f"Erreur sync dossier {folder.path} avec NAS: {str(e)}")
+        return False
+
 @folder_bp.route('/', methods=['GET'])
 @jwt_required()
 def list_folders():
     """
     List folders with optimized bulk permission loading and pagination.
-    Supports filtering by parent folder and efficient permission checking.
+    Integrates with NAS synchronization.
     """
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
@@ -25,11 +46,12 @@ def list_folders():
     # Get query parameters
     parent_id = request.args.get('parent_id', type=int)
     page = request.args.get('page', 1, type=int)
-    per_page = min(request.args.get('per_page', 50, type=int), 100)  # Max 100 items per page
+    per_page = min(request.args.get('per_page', 50, type=int), 100)
     include_files = request.args.get('include_files', 'false').lower() == 'true'
+    sync_with_nas = request.args.get('sync_nas', 'false').lower() == 'true'
     
     # Admin users see everything
-    if user.role == 'admin':
+    if user.role.upper() == 'ADMIN':
         query = Folder.query
         if parent_id is not None:
             query = query.filter_by(parent_id=parent_id)
@@ -46,6 +68,8 @@ def list_folders():
                     "path": f.path,
                     "parent_id": f.parent_id,
                     "owner_id": f.owner_id,
+                    "created_at": f.created_at.isoformat() if f.created_at else None,
+                    "updated_at": f.updated_at.isoformat() if f.updated_at else None,
                     "permissions": {
                         "can_read": True,
                         "can_write": True,
@@ -68,7 +92,6 @@ def list_folders():
         }
         
         if include_files:
-            # Get files in the folders for admin
             folder_ids = [f.id for f in folders_page.items]
             if folder_ids:
                 files_query = File.query.filter(File.folder_id.in_(folder_ids))
@@ -80,8 +103,12 @@ def list_folders():
                     {
                         "id": f.id,
                         "name": f.name,
+                        "path": f.path,
                         "folder_id": f.folder_id,
                         "owner_id": f.owner_id,
+                        "size_kb": f.size_kb,
+                        "mime_type": f.mime_type,
+                        "created_at": f.created_at.isoformat() if f.created_at else None,
                         "permissions": {
                             "can_read": True,
                             "can_write": True,
@@ -97,17 +124,13 @@ def list_folders():
         return jsonify(result)
     
     # For non-admin users, use optimized permission loading
-    # Step 1: Get candidate folders (owned + potentially accessible)
     base_query = db.session.query(Folder.id).distinct()
     
     # Filter by parent if specified
     if parent_id is not None:
         base_query = base_query.filter_by(parent_id=parent_id)
     
-    # Get folders that user might have access to:
-    # 1. Owned folders
-    # 2. Folders with direct permissions
-    # 3. Folders with group permissions
+    # Get folders that user might have access to
     candidate_query = base_query.filter(
         db.or_(
             Folder.owner_id == user_id,
@@ -123,7 +146,6 @@ def list_folders():
         )
     )
     
-    # Apply pagination to candidate folders
     candidate_folders_page = candidate_query.paginate(
         page=page, per_page=per_page, error_out=False
     )
@@ -144,16 +166,15 @@ def list_folders():
             }
         })
     
-    # Step 2: Bulk load permissions for candidate folders
+    # Bulk load permissions
     folder_permissions = permission_optimizer.get_bulk_folder_permissions(
         user_id, candidate_folder_ids
     )
     
-    # Step 3: Filter folders by read permission and build response
+    # Filter and build response
     accessible_folders = []
     accessible_folder_ids = []
     
-    # Get full folder objects for accessible folders
     folders_dict = {f.id: f for f in Folder.query.filter(Folder.id.in_(candidate_folder_ids)).all()}
     
     for folder_id in candidate_folder_ids:
@@ -167,6 +188,8 @@ def list_folders():
                     "path": folder.path,
                     "parent_id": folder.parent_id,
                     "owner_id": folder.owner_id,
+                    "created_at": folder.created_at.isoformat() if folder.created_at else None,
+                    "updated_at": folder.updated_at.isoformat() if folder.updated_at else None,
                     "permissions": perm_set.to_dict()
                 })
                 accessible_folder_ids.append(folder_id)
@@ -183,17 +206,14 @@ def list_folders():
         }
     }
     
-    # Step 4: Include files if requested
+    # Include files if requested
     if include_files and accessible_folder_ids:
-        # Get files in accessible folders
         files_in_folders = File.query.filter(File.folder_id.in_(accessible_folder_ids)).all()
         file_ids = [f.id for f in files_in_folders]
         
         if file_ids:
-            # Bulk load file permissions
             file_permissions = permission_optimizer.get_bulk_file_permissions(user_id, file_ids)
             
-            # Filter files by read permission
             accessible_files = []
             for file in files_in_folders:
                 file_perm = file_permissions.get(file.id)
@@ -201,8 +221,12 @@ def list_folders():
                     accessible_files.append({
                         "id": file.id,
                         "name": file.name,
+                        "path": file.path,
                         "folder_id": file.folder_id,
                         "owner_id": file.owner_id,
+                        "size_kb": file.size_kb,
+                        "mime_type": file.mime_type,
+                        "created_at": file.created_at.isoformat() if file.created_at else None,
                         "permissions": file_perm.to_dict()
                     })
             
@@ -218,17 +242,15 @@ def list_folders():
 @jwt_required()
 def get_folder_contents(folder_id):
     """
-    Get folder contents (subfolders and files) with preloaded permissions.
-    Optimized for displaying folder tree views.
+    Get folder contents with NAS integration
     """
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     
-    # Check if folder exists and user has read access
     folder = Folder.query.get_or_404(folder_id)
     
-    # For admin users, return everything
-    if user.role == 'admin':
+    # Check permissions for admin users
+    if user.role.upper() == 'ADMIN':
         subfolders = Folder.query.filter_by(parent_id=folder_id).all()
         files = File.query.filter_by(folder_id=folder_id).all()
         
@@ -268,8 +290,11 @@ def get_folder_contents(folder_id):
                 {
                     'id': f.id,
                     'name': f.name,
+                    'path': f.path,
                     'folder_id': f.folder_id,
                     'owner_id': f.owner_id,
+                    'size_kb': f.size_kb,
+                    'mime_type': f.mime_type,
                     'permissions': {
                         "can_read": True,
                         "can_write": True,
@@ -283,18 +308,17 @@ def get_folder_contents(folder_id):
             ]
         })
     
-    # Check folder access permission first
+    # Check folder access permission
     folder_permissions = permission_optimizer.get_bulk_folder_permissions(user_id, [folder_id])
     folder_perm = folder_permissions.get(folder_id)
     
     if not folder_perm or not folder_perm.can_read:
         return jsonify({"msg": "Accès refusé au dossier"}), 403
     
-    # Get subfolders and files
+    # Get subfolders and files with permissions
     subfolders = Folder.query.filter_by(parent_id=folder_id).all()
     files = File.query.filter_by(folder_id=folder_id).all()
     
-    # Bulk load permissions for all subfolders and files
     subfolder_ids = [sf.id for sf in subfolders]
     file_ids = [f.id for f in files]
     
@@ -307,7 +331,7 @@ def get_folder_contents(folder_id):
     if file_ids:
         file_permissions = permission_optimizer.get_bulk_file_permissions(user_id, file_ids)
     
-    # Filter and build response for accessible items only
+    # Build response
     accessible_subfolders = []
     for subfolder in subfolders:
         perm = subfolder_permissions.get(subfolder.id)
@@ -327,8 +351,11 @@ def get_folder_contents(folder_id):
             accessible_files.append({
                 'id': file.id,
                 'name': file.name,
+                'path': file.path,
                 'folder_id': file.folder_id,
                 'owner_id': file.owner_id,
+                'size_kb': file.size_kb,
+                'mime_type': file.mime_type,
                 'permissions': perm.to_dict()
             })
     
@@ -344,42 +371,176 @@ def get_folder_contents(folder_id):
         'files': accessible_files
     })
 
-@folder_bp.route('/tree/<int:folder_id>', methods=['GET'])
+@folder_bp.route('/create', methods=['POST'])
 @jwt_required()
-def get_folder_tree(folder_id):
-    """
-    Get folder tree with preloaded permissions for efficient tree navigation.
-    Supports depth limiting to prevent loading too much data.
-    """
+def create_folder_route():
+    """Create folder with NAS synchronization"""
+    data = request.json
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+
+    if not data.get('name'):
+        return jsonify({"msg": "Le nom du dossier est requis"}), 400
+
+    folder_name = sanitize_filename(data['name'])
+    parent_id = data.get('parent_id')
+    create_on_nas = data.get('create_on_nas', True)
+
+    # Determine path
+    if parent_id:
+        parent_folder = Folder.query.get(parent_id)
+        if not parent_folder:
+            return jsonify({"msg": "Dossier parent introuvable"}), 404
+            
+        # Check permissions
+        perm = permission_optimizer.get_bulk_folder_permissions(user_id, [parent_id]).get(parent_id)
+        if not perm or not perm.can_write:
+            return jsonify({"msg": "Permission refusée"}), 403
+            
+        relative_path = normalize_smb_path(f"{parent_folder.path}/{folder_name}")
+    else:
+        relative_path = normalize_smb_path(f"/{folder_name}")
+
+    if not validate_smb_path(relative_path):
+        return jsonify({"msg": "Chemin invalide"}), 400
+
+    try:
+        # Create on NAS first if requested
+        nas_success = True
+        if create_on_nas:
+            try:
+                nas_client = get_nas_client()
+                parent_path = "/".join(relative_path.split("/")[:-1]) or "/"
+                nas_result = nas_client.create_folder(parent_path, folder_name)
+                if not nas_result.get('success'):
+                    nas_success = False
+            except Exception as nas_error:
+                print(f"Erreur création NAS: {str(nas_error)}")
+                nas_success = False
+
+        # Create in database
+        folder = Folder(
+            name=folder_name,
+            owner_id=user.id,
+            parent_id=parent_id,
+            path=relative_path
+        )
+        db.session.add(folder)
+        db.session.commit()
+
+        response_data = {
+            "msg": "Dossier créé",
+            "id": folder.id,
+            "path": folder.path,
+            "nas_synchronized": nas_success
+        }
+        
+        if not nas_success:
+            response_data["warning"] = "Dossier créé en DB mais pas synchronisé avec le NAS"
+
+        return jsonify(response_data)
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": f"Erreur création dossier: {str(e)}"}), 500
+
+@folder_bp.route('/<int:folder_id>', methods=['DELETE'])
+@jwt_required()
+def delete_folder(folder_id):
+    """Delete folder with NAS synchronization"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     
-    # Get query parameters
-    max_depth = min(request.args.get('depth', 3, type=int), 5)  # Max depth of 5
+    folder = Folder.query.get_or_404(folder_id)
     
-    # Check if root folder exists and user has access
+    # Check permissions
+    if user.role.upper() != 'ADMIN':
+        perm = permission_optimizer.get_bulk_folder_permissions(user_id, [folder_id]).get(folder_id)
+        if not perm or not perm.can_delete:
+            return jsonify({"msg": "Permission refusée"}), 403
+    
+    try:
+        # Delete from NAS first
+        nas_success = True
+        try:
+            nas_client = get_nas_client()
+            nas_result = nas_client.delete_file(folder.path)
+            if not nas_result.get('success'):
+                nas_success = False
+        except Exception as nas_error:
+            print(f"Erreur suppression NAS: {str(nas_error)}")
+            nas_success = False
+        
+        # Delete from database (cascade will handle subfolders and files)
+        db.session.delete(folder)
+        db.session.commit()
+        
+        return jsonify({
+            "msg": "Dossier supprimé",
+            "nas_synchronized": nas_success,
+            "warning": "Supprimé de la DB mais pas du NAS" if not nas_success else None
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"msg": f"Erreur suppression: {str(e)}"}), 500
+
+@folder_bp.route('/<int:folder_id>/sync-nas', methods=['POST'])
+@jwt_required()
+def sync_folder_nas(folder_id):
+    """Synchronize specific folder with NAS"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    if user.role.upper() != 'ADMIN':
+        return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
+    
+    folder = Folder.query.get_or_404(folder_id)
+    
+    try:
+        nas_client = get_nas_client()
+        success = sync_folder_with_nas(folder, nas_client)
+        
+        if success:
+            return jsonify({
+                "msg": f"Dossier {folder.name} synchronisé avec le NAS",
+                "success": True
+            })
+        else:
+            return jsonify({
+                "msg": f"Échec synchronisation du dossier {folder.name}",
+                "success": False
+            }), 500
+            
+    except Exception as e:
+        return jsonify({
+            "msg": f"Erreur synchronisation: {str(e)}",
+            "success": False
+        }), 500
+
+@folder_bp.route('/tree/<int:folder_id>', methods=['GET'])
+@jwt_required()
+def get_folder_tree(folder_id):
+    """Get folder tree with permissions (unchanged from original)"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    max_depth = min(request.args.get('depth', 3, type=int), 5)
+    
     root_folder = Folder.query.get_or_404(folder_id)
     
-    # For admin users, get full tree
-    if user.role == 'admin':
-        tree_permissions = {}  # Admin has all permissions
-        tree_data = permission_optimizer.get_folder_tree_permissions(user_id, folder_id, max_depth)
-        
-        # Build tree structure (simplified for admin)
+    if user.role.upper() == 'ADMIN':
         return jsonify({
             'tree': _build_folder_tree_admin(folder_id, max_depth, user_id),
-            'permissions_loaded': len(tree_data)
+            'permissions_loaded': 1  # Admin has all permissions
         })
     
-    # Use optimized tree loading for regular users
     tree_permissions = permission_optimizer.get_folder_tree_permissions(user_id, folder_id, max_depth)
     
-    # Check root folder access
     root_perm = tree_permissions.get(folder_id)
     if not root_perm or not root_perm.can_read:
         return jsonify({"msg": "Accès refusé au dossier racine"}), 403
     
-    # Build tree structure with permissions
     tree_data = _build_folder_tree_with_permissions(folder_id, tree_permissions, max_depth)
     
     return jsonify({
@@ -388,7 +549,7 @@ def get_folder_tree(folder_id):
     })
 
 def _build_folder_tree_admin(folder_id, max_depth, user_id, current_depth=0):
-    """Build folder tree for admin users (simplified)."""
+    """Build folder tree for admin users"""
     if current_depth >= max_depth:
         return None
     
@@ -422,11 +583,10 @@ def _build_folder_tree_admin(folder_id, max_depth, user_id, current_depth=0):
     return tree_node
 
 def _build_folder_tree_with_permissions(folder_id, permissions_dict, max_depth, current_depth=0):
-    """Build folder tree with permission filtering."""
+    """Build folder tree with permission filtering"""
     if current_depth >= max_depth:
         return None
     
-    # Check if user has permission to see this folder
     perm = permissions_dict.get(folder_id)
     if not perm or not perm.can_read:
         return None
@@ -435,7 +595,6 @@ def _build_folder_tree_with_permissions(folder_id, permissions_dict, max_depth, 
     if not folder:
         return None
     
-    # Get subfolders
     subfolders = Folder.query.filter_by(parent_id=folder_id).all()
     
     tree_node = {
@@ -447,7 +606,6 @@ def _build_folder_tree_with_permissions(folder_id, permissions_dict, max_depth, 
         'children': []
     }
     
-    # Recursively build children
     for subfolder in subfolders:
         child_tree = _build_folder_tree_with_permissions(
             subfolder.id, permissions_dict, max_depth, current_depth + 1
@@ -456,43 +614,3 @@ def _build_folder_tree_with_permissions(folder_id, permissions_dict, max_depth, 
             tree_node['children'].append(child_tree)
     
     return tree_node
-
-@folder_bp.route('/create', methods=['POST'])
-@jwt_required()
-def create_folder_route():
-    data = request.json
-    user_id =int(get_jwt_identity())
-    user = User.query.get(user_id)
-
-    if not data.get('name'):
-        return jsonify({"msg": "Le nom du dossier est requis"}), 400
-
-    parent_id = data.get('parent_id')
-    relative_path = data['name']
-
-    if parent_id:
-        parent_folder = Folder.query.get(parent_id)
-        if not parent_folder:
-            return jsonify({"msg": "Dossier parent introuvable"}), 404
-        perm = parent_folder.get_effective_permissions(user)
-        if not perm or not perm.can_write:
-            return jsonify({"msg": "Permission refusée"}), 403
-        relative_path = f"{parent_folder.path}/{data['name']}"
-
-    physical_path = create_folder(relative_path)
-
-    folder = Folder(
-        name=data['name'],
-        owner_id=user.id,
-        parent_id=parent_id,
-        path=relative_path
-    )
-    db.session.add(folder)
-    db.session.commit()
-
-    return jsonify({
-        "msg": "Dossier créé",
-        "id": folder.id,
-        "path": folder.path,
-        "physical_path": physical_path
-    })

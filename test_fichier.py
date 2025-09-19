@@ -1,30 +1,25 @@
-import os
+# smb_test.py
+from smb.SMBConnection import SMBConnection
 
-# Chemin de base pour les tests
-BASE_PATH = r"C:\Users\Elite650\Desktop\Document"
+# ================= CONFIGURATION =================
+username = 'gestion'       # ton login SMB
+password = 'Aeronav99'      # ton mot de passe SMB
+client_name = 'admin'           # nom de ton PC (n'importe quoi)
+server_name = 'NAS_SERVER'          # nom NetBIOS du NAS (ou IP)
+server_ip = '10.61.17.33'         # IP du NAS
+shared_folder = 'NAS'           # nom du dossier partagé SMB
+domain_name = ''                     # laisse vide si pas de domaine
 
-def create_test_folder(folder_name):
-    """
-    Crée un dossier dans BASE_PATH avec le nom donné.
-    """
-    if not folder_name:
-        print("Erreur : nom du dossier vide")
-        return None
+# ================== CONNEXION ==================
+conn = SMBConnection(username, password, client_name, server_name, domain=domain_name, use_ntlm_v2=True)
+# assert conn.connect(server_ip, 139), "Connexion échouée !"  # port 139 ou 445 selon le NAS
 
-    # chemin complet
-    full_path = os.path.join(BASE_PATH, folder_name)
+if conn.connect(server_ip, 139):
+    print("Connexion réussie !")
 
-    try:
-        os.makedirs(full_path, exist_ok=True)  # exist_ok=True évite l'erreur si le dossier existe
-        print(f"Dossier créé avec succès : {full_path}")
-        return full_path
-    except Exception as e:
-        print(f"Erreur lors de la création du dossier : {e}")
-        return None
-
-if __name__ == "__main__":
-    # Test : créer un dossier "TestFolder1"
-    create_test_folder("TestFolder1")
-
-    # Test : créer un sous-dossier "TestFolder2/SubFolder"
-    create_test_folder(r"TestFolder2\SubFolder")
+    # Lister les fichiers du partage
+    files = conn.listPath(shared_folder, '/')
+    for f in files:
+        print(f.filename, "<DIR>" if f.isDirectory else f.file_size)
+else:
+    print("Connexion échouée !")

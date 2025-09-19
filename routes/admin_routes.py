@@ -11,7 +11,7 @@ from models.access_log import AccessLog
 from extensions import db
 from functools import wraps
 from datetime import datetime, timezone
-from services.file_service import create_folder
+from services.file_storage_service import FileStorageService
 
 admin_bp = Blueprint('admin', __name__, url_prefix='/admin')
 
@@ -359,12 +359,142 @@ def get_access_logs():
 @admin_bp.route('/stats', methods=['GET'])
 @admin_required
 def get_statistics():
-    stats = {
-        'total_users': User.query.count(),
-        'total_groups': Group.query.count(),
-        'total_folders': Folder.query.count(),
-        'total_files': File.query.count(),
-        'admin_users': User.query.filter_by(role='ADMIN').count(),
-        'simple_users': User.query.filter_by(role='SIMPLE_USER').count()
-    }
-    return jsonify(stats), 200
+    """Get statistics - optionally sync with NAS first"""
+    sync_with_nas = request.args.get('sync', 'false').lower() == 'true'
+    
+    try:
+        if sync_with_nas:
+            # Import here to avoid circular imports
+            from services.nas_sync_service import nas_sync_service
+            
+            # Perform sync and get real statistics
+            sync_result = nas_sync_service.full_sync(dry_run=False)
+            if sync_result['success']:
+                stats = nas_sync_service.get_real_statistics()
+                stats['sync_performed'] = True
+                stats['sync_stats'] = sync_result['stats']
+            else:
+                # Fallback to database stats if sync fails
+                stats = {
+                    'total_users': User.query.count(),
+                    'total_groups': Group.query.count(),
+                    'total_folders': Folder.query.count(),
+                    'total_files': File.query.count(),
+                    'admin_users': User.query.filter_by(role='ADMIN').count(),
+                    'simple_users': User.query.filter_by(role='SIMPLE_USER').count(),
+                    'sync_performed': False,
+                    'sync_error': sync_result.get('message', 'Sync failed')
+                }
+        else:
+            # Regular database statistics
+            stats = {
+                'total_users': User.query.count(),
+                'total_groups': Group.query.count(),
+                'total_folders': Folder.query.count(),
+                'total_files': File.query.count(),
+                'admin_users': User.query.filter_by(role='ADMIN').count(),
+                'simple_users': User.query.filter_by(role='SIMPLE_USER').count(),
+                'sync_performed': False
+            }
+        
+        return jsonify(stats), 200
+        
+    except Exception as e:
+        # Fallback to basic stats if anything fails
+        stats = {
+            'total_users': User.query.count(),
+            'total_groups': Group.query.count(),
+            'total_folders': Folder.query.count(),
+            'total_files': File.query.count(),
+            'admin_users': User.query.filter_by(role='ADMIN').count(),
+            'simple_users': User.query.filter_by(role='SIMPLE_USER').count(),
+            'sync_performed': False,
+            'error': str(e)
+        }
+        return jsonify(stats), 200
+
+@admin_bp.route('/sync-nas', methods=['POST'])
+@admin_required
+def sync_with_nas():
+    """Synchronize database with NAS content"""
+    data = request.get_json() or {}
+    dry_run = data.get('dry_run', False)
+    max_depth = data.get('max_depth', 10)
+    
+    try:
+        from services.nas_sync_service import nas_sync_service
+        
+        result = nas_sync_service.full_sync(
+            max_depth=max_depth,
+            default_owner_id=1,  # Default to admin user
+            dry_run=dry_run
+        )
+        
+        if result['success']:
+            return jsonify({
+                'success': True,
+                'message': result['message'],
+                'stats': result['stats'],
+                'nas_structure': result.get('nas_structure', {}),
+                'db_structure': result.get('db_structure', {})
+            }), 200
+        else:
+            # Check if it's a connection issue
+            status_code = 400 if result.get('nas_accessible') == False else 500
+            return jsonify({
+                'success': False,
+                'message': result['message'],
+                'stats': result['stats'],
+                'nas_accessible': result.get('nas_accessible', True)
+            }), status_code
+            
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Sync failed: {str(e)}',
+            'error': str(e)
+        }), 500
+
+@admin_bp.route('/nas-status', methods=['GET'])
+@admin_required
+def get_nas_status():
+    """Get NAS connection status and basic info"""
+    try:
+        from services.nas_sync_service import nas_sync_service
+        
+        # Set a shorter timeout for connection test
+        import socket
+        original_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(5.0)  # 5 second timeout
+        
+        try:
+            is_connected = nas_sync_service.test_nas_connection()
+            
+            if is_connected:
+                # Get basic NAS info
+                client = nas_sync_service._get_smb_client()
+                test_result = client.test_connection()
+                
+                return jsonify({
+                    'connected': True,
+                    'server_info': test_result.get('server_info', {}),
+                    'root_files_count': test_result.get('root_files_count', 0),
+                    'message': 'NAS connection successful'
+                }), 200
+            else:
+                return jsonify({
+                    'connected': False,
+                    'message': 'NAS not accessible - check network connection to work environment',
+                    'errors': nas_sync_service.sync_stats.get('errors', [])
+                }), 200
+                
+        finally:
+            socket.setdefaulttimeout(original_timeout)
+            
+    except Exception as e:
+        return jsonify({
+            'connected': False,
+            'message': f'NAS connection test failed: {str(e)}',
+            'error': str(e),
+            'suggestion': 'Make sure you are connected to the work network'
+        }), 200  # Return 200 instead of 500 for connection issues

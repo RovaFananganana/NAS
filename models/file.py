@@ -8,11 +8,14 @@ class File(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(200), nullable=False)
-    path = db.Column(db.String(500), nullable=False)
+    file_path = db.Column(db.String(500), nullable=True)  # Physical file path
+    path = db.Column(db.String(500), nullable=False)  # Legacy field, keep for compatibility
     size_kb = db.Column(db.Integer, nullable=False)
+    mime_type = db.Column(db.String(100), nullable=True)  # MIME type for file type detection
     owner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     folder_id = db.Column(db.Integer, db.ForeignKey("folders.id"), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
 # liens pour les permissions des utilisateurs
     permissions = db.relationship("FilePermission", back_populates="file", cascade="all, delete-orphan")    

@@ -14,9 +14,18 @@ class Config:
     SQLALCHEMY_DATABASE_URI = (
         f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     )
+    
+    # Connection NAS
+    SMB_USERNAME = os.getenv("SMB_USERNAME", "gestion")
+    SMB_PASSWORD = os.getenv("SMB_PASSWORD", "Aeronav99")
+    SMB_SERVER_IP = os.getenv("SMB_SERVER_IP", "10.61.17.33")
+    SMB_SERVER_NAME = os.getenv("SMB_SERVER_NAME", "NAS_SERVER")
+    SMB_SHARED_FOLDER = os.getenv("SMB_SHARED_FOLDER", "NAS")
+    SMB_CLIENT_NAME = os.getenv("SMB_CLIENT_NAME", "admin")
+    SMB_DOMAIN = os.getenv("SMB_DOMAIN", "")
 
     SQLALCHEMY_TRACK_MODIFICATIONS = False
-    SECRET_KEY = os.getenv("SECRET_KEY", "dev_secret")
+    # SECRET_KEY = os.getenv("SECRET_KEY", "dev_secret")
 
         # JWT Configuration
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")  

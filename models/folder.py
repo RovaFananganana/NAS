@@ -9,9 +9,12 @@ class Folder(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False)
+    path = db.Column(db.String(500), nullable=True, unique=True)  # Full path for Windows-like navigation
+    parent_path = db.Column(db.String(500), nullable=True)  # Parent folder path
     owner_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
     parent_id = db.Column(db.Integer, db.ForeignKey("folders.id"), nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
     # Relations
     children = db.relationship("Folder", backref=db.backref("parent", remote_side=[id]), lazy=True)
