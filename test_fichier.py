@@ -11,10 +11,10 @@ shared_folder = 'NAS'           # nom du dossier partagé SMB
 domain_name = ''                     # laisse vide si pas de domaine
 
 # ================== CONNEXION ==================
-conn = SMBConnection(username, password, client_name, server_name, domain=domain_name, use_ntlm_v2=True)
+conn = SMBConnection(username, password, client_name, server_name, domain=domain_name, use_ntlm_v2=True, is_direct_tcp=True)
 # assert conn.connect(server_ip, 139), "Connexion échouée !"  # port 139 ou 445 selon le NAS
 
-if conn.connect(server_ip, 139):
+if conn.connect(server_ip, 445):
     print("Connexion réussie !")
 
     # Lister les fichiers du partage

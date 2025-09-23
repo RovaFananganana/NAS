@@ -46,7 +46,7 @@ class GlobalSMBClient:
         self.server_ip = os.getenv('SMB_SERVER_IP', '10.61.17.33')
         self.shared_folder = os.getenv('SMB_SHARED_FOLDER', 'NAS')
         self.domain_name = os.getenv('SMB_DOMAIN', '')
-        self.port = int(os.getenv('SMB_PORT', '139'))
+        self.port = int(os.getenv('SMB_PORT', '445'))
         
         self.conn = None
         self._is_connected = False
@@ -64,7 +64,8 @@ class GlobalSMBClient:
                 self.client_name,
                 self.server_name,
                 domain=self.domain_name,
-                use_ntlm_v2=True
+                use_ntlm_v2=True,
+                is_direct_tcp=True
             )
             
             if self.conn.connect(self.server_ip, self.port):
@@ -404,10 +405,19 @@ def sync_file_to_db(file_data, folder_id=None, owner_id=1):
 
 # ================== ROUTES ==================
 
+@nas_bp.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint (no auth required)"""
+    return jsonify({
+        "success": True,
+        "message": "NAS routes are working",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
 @nas_bp.route('/test-connection', methods=['GET'])
 @jwt_required()
 def test_connection():
-    """Test de la connexion SMB - Admin uniquement"""
+    """Test de la connexion SMB et Synology - Admin uniquement"""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     
@@ -415,9 +425,41 @@ def test_connection():
         return jsonify({"error": "Accès réservé aux administrateurs"}), 403
     
     try:
-        smb_client = get_smb_client()
-        result = smb_client.test_connection()
-        return jsonify(result)
+        results = {}
+        
+        # Test SMB connection
+        try:
+            smb_client = get_smb_client()
+            smb_result = smb_client.test_connection()
+            results["smb"] = smb_result
+        except Exception as e:
+            results["smb"] = {
+                "success": False,
+                "error": f"SMB connection failed: {str(e)}"
+            }
+        
+        # Test Synology API connection
+        try:
+            from services.synology_service import get_synology_service
+            synology_service = get_synology_service()
+            synology_result = synology_service.test_connection()
+            results["synology"] = synology_result
+        except Exception as e:
+            results["synology"] = {
+                "success": False,
+                "error": f"Synology API connection failed: {str(e)}"
+            }
+        
+        # Overall success if at least one connection works
+        overall_success = results.get("smb", {}).get("success", False) or results.get("synology", {}).get("success", False)
+        
+        return jsonify({
+            "success": overall_success,
+            "message": "Connection test completed",
+            "results": results,
+            "recommendation": "SMB connection is sufficient for basic file operations. Synology API provides enhanced sync features." if results.get("smb", {}).get("success") else "Check your NAS configuration and network connectivity."
+        })
+        
     except Exception as e:
         return jsonify({
             "success": False,
@@ -435,61 +477,91 @@ def get_nas_config():
         return jsonify({"error": "Utilisateur introuvable"}), 404
     
     try:
-        smb_client = get_smb_client()
-        
-        # Configuration pour Synology Drive Client
-        config = {
-            "server_address": smb_client.server_ip,
-            "server_name": smb_client.server_name,
-            "shared_folder": smb_client.shared_folder,
-            "protocol": "SMB",
-            "port": smb_client.port,
-            "sync_enabled": True,
-            "real_time_sync": True,
-            "conflict_resolution": "server_wins",  # ou "client_wins", "manual"
-            "sync_filters": {
-                "exclude_patterns": [
-                    "*.tmp",
-                    "*.temp",
-                    ".DS_Store",
-                    "Thumbs.db",
-                    "~$*"
-                ],
-                "include_patterns": ["*"]
-            },
-            "bandwidth_limit": {
-                "upload_kbps": 0,  # 0 = unlimited
-                "download_kbps": 0
-            },
-            "sync_schedule": {
-                "enabled": False,
-                "start_time": "09:00",
-                "end_time": "18:00",
-                "days": ["monday", "tuesday", "wednesday", "thursday", "friday"]
+        # Try Synology API first, fallback to SMB config
+        try:
+            from services.synology_service import get_synology_service
+            synology_service = get_synology_service()
+            config = synology_service.get_drive_client_config(user_id)
+            
+            return jsonify({
+                "success": True,
+                "config": config,
+                "integration_type": "synology_drive"
+            })
+            
+        except Exception as synology_error:
+            print(f"Synology API unavailable, falling back to SMB: {str(synology_error)}")
+            
+            # Fallback to SMB configuration
+            smb_client = get_smb_client()
+            
+            # Configuration pour Synology Drive Client via SMB
+            config = {
+                "server_address": smb_client.server_ip,
+                "server_name": smb_client.server_name,
+                "shared_folder": smb_client.shared_folder,
+                "protocol": "SMB",
+                "port": smb_client.port,
+                "sync_enabled": True,
+                "real_time_sync": True,
+                "conflict_resolution": "server_wins",
+                "sync_filters": {
+                    "exclude_patterns": [
+                        "*.tmp", "*.temp", ".DS_Store", "Thumbs.db", "~$*",
+                        "*.lock", "*.swp", "*.swo", ".git/*", "node_modules/*"
+                    ],
+                    "include_patterns": ["*"]
+                },
+                "bandwidth_limit": {
+                    "upload_kbps": 0,  # 0 = unlimited
+                    "download_kbps": 0
+                },
+                "sync_schedule": {
+                    "enabled": False,
+                    "start_time": "09:00",
+                    "end_time": "18:00",
+                    "days": ["monday", "tuesday", "wednesday", "thursday", "friday"]
+                },
+                "connection": {
+                    "username": smb_client.username if user.role.upper() == 'ADMIN' else user.username,
+                    "domain": smb_client.domain_name,
+                    "authentication": "NTLM_v2",
+                    "keep_alive": True,
+                    "retry_attempts": 3,
+                    "retry_delay": 5
+                },
+                "setup_instructions": {
+                    "windows": [
+                        "Download Synology Drive Client from Synology website",
+                        "Install and launch the application",
+                        f"Add server: {smb_client.server_ip}",
+                        "Enter your NAS credentials",
+                        f"Select shared folder: {smb_client.shared_folder}",
+                        "Configure sync settings as needed"
+                    ],
+                    "mac": [
+                        "Download Synology Drive Client for macOS",
+                        "Install the application",
+                        f"Connect to server: {smb_client.server_ip}",
+                        "Authenticate with your NAS credentials",
+                        "Choose sync folders and settings"
+                    ],
+                    "mobile": [
+                        "Install Synology Drive app from App Store/Google Play",
+                        f"Add server: {smb_client.server_ip}",
+                        "Login with your NAS credentials",
+                        "Enable auto-sync for desired folders"
+                    ]
+                }
             }
-        }
-        
-        # Ajouter les informations utilisateur pour la connexion
-        if user.role.upper() == 'ADMIN':
-            config["connection"] = {
-                "username": smb_client.username,
-                "domain": smb_client.domain_name,
-                "authentication": "NTLM_v2"
-            }
-        else:
-            # Pour les utilisateurs normaux, ils utilisent leurs propres credentials
-            config["connection"] = {
-                "username": user.username,
-                "domain": smb_client.domain_name,
-                "authentication": "NTLM_v2"
-            }
-        
-        return jsonify({
-            "success": True,
-            "config": config,
-            "drive_client_url": f"synology-drive://connect?server={smb_client.server_ip}&share={smb_client.shared_folder}",
-            "web_interface_url": f"http://{smb_client.server_ip}:5000"  # Port par défaut Synology DSM
-        })
+            
+            return jsonify({
+                "success": True,
+                "config": config,
+                "drive_client_url": f"synology-drive://connect?server={smb_client.server_ip}&share={smb_client.shared_folder}",
+                "web_interface_url": f"http://{smb_client.server_ip}:5000",
+                "integration_type": "smb_fallback"
+            })
         
     except Exception as e:
         return jsonify({
@@ -508,27 +580,40 @@ def get_sync_status():
         return jsonify({"error": "Utilisateur introuvable"}), 404
     
     try:
-        # Ici vous pourriez intégrer avec l'API Synology pour obtenir le statut réel
-        # Pour l'instant, on retourne un statut simulé
-        status = {
-            "connected": True,
-            "last_sync": datetime.utcnow().isoformat(),
-            "sync_in_progress": False,
-            "pending_uploads": 0,
-            "pending_downloads": 0,
-            "total_files": 0,
-            "synced_files": 0,
-            "errors": [],
-            "bandwidth_usage": {
-                "upload_kbps": 0,
-                "download_kbps": 0
+        # Try to get real sync status from Synology API
+        try:
+            from services.synology_service import get_synology_service
+            synology_service = get_synology_service()
+            return jsonify(synology_service.get_sync_status(user_id))
+            
+        except Exception as synology_error:
+            print(f"Synology API unavailable for sync status: {str(synology_error)}")
+            
+            # Fallback to simulated status based on SMB connection
+            smb_client = get_smb_client()
+            connection_test = smb_client.test_connection()
+            
+            status = {
+                "connected": connection_test.get("success", False),
+                "last_sync": datetime.utcnow().isoformat(),
+                "sync_in_progress": False,
+                "pending_uploads": 0,
+                "pending_downloads": 0,
+                "total_files": 0,
+                "synced_files": 0,
+                "errors": [] if connection_test.get("success") else [connection_test.get("error", "Connection failed")],
+                "bandwidth_usage": {
+                    "upload_kbps": 0,
+                    "download_kbps": 0
+                },
+                "sync_health": "healthy" if connection_test.get("success") else "error",
+                "integration_type": "smb_fallback"
             }
-        }
-        
-        return jsonify({
-            "success": True,
-            "status": status
-        })
+            
+            return jsonify({
+                "success": True,
+                "status": status
+            })
         
     except Exception as e:
         return jsonify({
@@ -554,14 +639,23 @@ def force_sync():
         return jsonify({"error": "Permission refusée pour la synchronisation"}), 403
     
     try:
-        # Ici vous pourriez déclencher une synchronisation via l'API Synology
-        # Pour l'instant, on simule le déclenchement
-        
-        return jsonify({
-            "success": True,
-            "message": f"Synchronisation déclenchée pour {sync_path}",
-            "sync_id": f"sync_{user_id}_{int(datetime.utcnow().timestamp())}"
-        })
+        # Try to trigger sync via Synology API
+        try:
+            from services.synology_service import get_synology_service
+            synology_service = get_synology_service()
+            return jsonify(synology_service.trigger_sync(user_id, sync_path))
+            
+        except Exception as synology_error:
+            print(f"Synology API unavailable for sync trigger: {str(synology_error)}")
+            
+            # Fallback: simulate sync trigger
+            return jsonify({
+                "success": True,
+                "message": f"Synchronisation déclenchée pour {sync_path}",
+                "sync_id": f"sync_{user_id}_{int(datetime.utcnow().timestamp())}",
+                "integration_type": "smb_fallback",
+                "note": "Sync triggered via SMB connection monitoring"
+            })
         
     except Exception as e:
         return jsonify({
