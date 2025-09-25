@@ -5,7 +5,7 @@ from models.folder import Folder
 from models.file import File
 from models.user import User
 from extensions import db
-from routes.nas_routes import get_smb_client
+# Import différé pour éviter l'import circulaire
 from utils.nas_utils import normalize_smb_path, get_file_mime_type
 import os
 from typing import Dict, List, Set, Tuple
@@ -30,6 +30,8 @@ class NasSyncService:
     def _get_smb_client(self):
         """Get SMB client instance"""
         if self.smb_client is None:
+            # Import différé pour éviter l'import circulaire
+            from routes.nas_routes import get_smb_client
             self.smb_client = get_smb_client()
         return self.smb_client
     
@@ -189,7 +191,7 @@ class NasSyncService:
     
     def remove_orphaned_entries(self, orphaned_entries: Dict, dry_run: bool = False) -> bool:
         """
-        Remove orphaned database entries
+        Remove orphaned database entries with proper foreign key handling
         """
         try:
             # Remove orphaned files first (to avoid foreign key issues)
@@ -208,23 +210,40 @@ class NasSyncService:
             
             for folder_record in orphaned_folders:
                 if not dry_run:
-                    # Remove associated permissions first
-                    from models.folder_permission import FolderPermission
-                    FolderPermission.query.filter_by(folder_id=folder_record.id).delete()
-                    
-                    # Remove the folder
-                    db.session.delete(folder_record)
+                    try:
+                        # Step 1: Remove associated permissions first (foreign key constraint)
+                        from models.folder_permission import FolderPermission
+                        permissions_deleted = FolderPermission.query.filter_by(folder_id=folder_record.id).delete()
+                        if permissions_deleted > 0:
+                            print(f"🗑️  Removed {permissions_deleted} permission(s) for folder: {folder_record.path}")
+                        
+                        # Step 2: Remove any child files that might still reference this folder
+                        child_files = File.query.filter_by(folder_id=folder_record.id).all()
+                        for child_file in child_files:
+                            db.session.delete(child_file)
+                            print(f"🗑️  Removed child file: {getattr(child_file, 'path', getattr(child_file, 'file_path', 'unknown'))}")
+                        
+                        # Step 3: Remove the folder itself
+                        db.session.delete(folder_record)
+                        
+                    except Exception as folder_error:
+                        print(f"❌ Error removing folder {folder_record.path}: {str(folder_error)}")
+                        # Continue with other folders even if one fails
+                        continue
+                
                 self.sync_stats['folders_removed'] += 1
                 print(f"🗑️  Removed orphaned folder: {folder_record.path}")
             
             if not dry_run:
                 db.session.commit()
+                print("✅ Database changes committed successfully")
                 
             return True
             
         except Exception as e:
             if not dry_run:
                 db.session.rollback()
+                print("❌ Database changes rolled back due to error")
             error_msg = f"Error removing orphaned entries: {str(e)}"
             self.sync_stats['errors'].append(error_msg)
             print(f"❌ {error_msg}")

@@ -27,6 +27,7 @@ from utils.nas_utils import (
 )
 from utils.permissions import PermissionSet
 from services.permission_optimizer import PermissionOptimizer
+from services.nas_sync_service import nas_sync_service
 
 load_dotenv()
 
@@ -1354,4 +1355,37 @@ def check_path_permissions():
         return jsonify({
             "success": False,
             "error": f"Erreur vérification permissions: {str(e)}"
+        }), 500
+
+@nas_bp.route('/sync', methods=['POST'])
+@jwt_required()
+def sync_nas_database():
+    """Synchronisation complète entre le NAS et la base de données"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    if not user or user.role.upper() != 'ADMIN':
+        return jsonify({"error": "Accès réservé aux administrateurs"}), 403
+    
+    data = request.get_json() or {}
+    dry_run = data.get('dry_run', False)
+    max_depth = data.get('max_depth', 10)
+    
+    try:
+        print(f"🔄 Démarrage synchronisation NAS-DB (dry_run={dry_run})")
+        
+        # Utiliser le service de synchronisation
+        result = nas_sync_service.full_sync(
+            max_depth=max_depth,
+            default_owner_id=user_id,
+            dry_run=dry_run
+        )
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        print(f"❌ Erreur synchronisation: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Erreur synchronisation: {str(e)}"
         }), 500
