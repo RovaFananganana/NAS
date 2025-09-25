@@ -46,7 +46,7 @@ class GlobalSMBClient:
         self.server_ip = os.getenv('SMB_SERVER_IP', '10.61.17.33')
         self.shared_folder = os.getenv('SMB_SHARED_FOLDER', 'NAS')
         self.domain_name = os.getenv('SMB_DOMAIN', '')
-        self.port = int(os.getenv('SMB_PORT', '445'))
+        self.port = int(os.getenv('SMB_PORT', '139'))
         
         self.conn = None
         self._is_connected = False
@@ -58,15 +58,59 @@ class GlobalSMBClient:
             if self._is_connected and self.conn:
                 return True
             
-            self.conn = SMBConnection(
-                self.username,
-                self.password,
-                self.client_name,
-                self.server_name,
-                domain=self.domain_name,
-                use_ntlm_v2=True,
-                is_direct_tcp=True
-            )
+            # Essayer différentes configurations SMB
+            try:
+                # Configuration 1: NetBIOS sur port 139
+                self.conn = SMBConnection(
+                    self.username,
+                    self.password,
+                    self.client_name,
+                    self.server_name,
+                    domain=self.domain_name,
+                    use_ntlm_v2=True,
+                    is_direct_tcp=False
+                )
+                if self.conn.connect(self.server_ip, 139):
+                    print(f"✅ Connexion SMB NetBIOS réussie sur port 139")
+                    return True
+            except Exception as e1:
+                print(f"❌ Échec NetBIOS port 139: {str(e1)}")
+            
+            try:
+                # Configuration 2: TCP direct sur port 445
+                self.conn = SMBConnection(
+                    self.username,
+                    self.password,
+                    self.client_name,
+                    self.server_name,
+                    domain=self.domain_name,
+                    use_ntlm_v2=True,
+                    is_direct_tcp=True
+                )
+                if self.conn.connect(self.server_ip, 445):
+                    print(f"✅ Connexion SMB TCP directe réussie sur port 445")
+                    return True
+            except Exception as e2:
+                print(f"❌ Échec TCP direct port 445: {str(e2)}")
+            
+            try:
+                # Configuration 3: NTLM v1 en fallback
+                self.conn = SMBConnection(
+                    self.username,
+                    self.password,
+                    self.client_name,
+                    self.server_name,
+                    domain=self.domain_name,
+                    use_ntlm_v2=False,
+                    is_direct_tcp=False
+                )
+                if self.conn.connect(self.server_ip, 139):
+                    print(f"✅ Connexion SMB NTLM v1 réussie sur port 139")
+                    return True
+            except Exception as e3:
+                print(f"❌ Échec NTLM v1: {str(e3)}")
+            
+            raise Exception("Toutes les configurations SMB ont échoué")
             
             if self.conn.connect(self.server_ip, self.port):
                 self._is_connected = True
@@ -87,7 +131,7 @@ class GlobalSMBClient:
             self._connect()
 
     def list_files(self, path="/"):
-        """Liste les fichiers et dossiers"""
+        """Liste les fichiers et dossiers avec fallback"""
         self._ensure_connected()
         
         try:
@@ -105,8 +149,11 @@ class GlobalSMBClient:
             
         except Exception as e:
             print(f"❌ Erreur listage {path}: {str(e)}")
-            # Une seule tentative de reconnexion
+            
+            # Essayer de reconnecter et relister
             try:
+                print("🔄 Tentative de reconnexion...")
+                self._is_connected = False
                 self._connect()
                 files = self.conn.listPath(self.shared_folder, path)
                 result = []
@@ -115,8 +162,10 @@ class GlobalSMBClient:
                         file_info = format_smb_file_info(file_obj, path)
                         result.append(file_info)
                 result.sort(key=lambda x: (not x['is_directory'], x['name'].lower()))
+                print(f"✅ Reconnexion réussie, {len(result)} éléments trouvés")
                 return result
             except Exception as e2:
+                print(f"❌ Échec de reconnexion: {str(e2)}")
                 raise Exception(f"Impossible de lister {path}: {str(e2)}")
 
     def create_folder(self, path, folder_name):
@@ -414,6 +463,198 @@ def health_check():
         "timestamp": datetime.utcnow().isoformat()
     })
 
+# Ancienne version supprimée - voir la nouvelle version plus bas
+
+# Ancienne version supprimée - voir la nouvelle version plus bas
+
+@nas_bp.route('/copy', methods=['POST'])
+@jwt_required()
+def copy_item():
+    """Copier un fichier ou dossier"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    data = request.get_json()
+    source_path = normalize_smb_path(data.get('source_path', '').strip())
+    dest_path = normalize_smb_path(data.get('dest_path', '').strip())
+
+    if not source_path or not dest_path:
+        return jsonify({"error": "Chemins source et destination requis"}), 400
+        
+    if not validate_smb_path(source_path) or not validate_smb_path(dest_path):
+        return jsonify({"error": "Chemin invalide"}), 400
+    
+    # Vérifier les permissions
+    source_parent = get_parent_path(source_path)
+    if not check_folder_permission(user, source_parent, 'read'):
+        return jsonify({"error": "Permission de lecture refusée sur le fichier source"}), 403
+        
+    if not check_folder_permission(user, dest_path, 'write'):
+        return jsonify({"error": "Permission d'écriture refusée sur le dossier destination"}), 403
+
+    try:
+        smb_client = get_smb_client()
+        
+        # Pour la copie, on doit télécharger puis uploader
+        # Obtenir le nom du fichier
+        filename = get_filename_from_path(source_path)
+        
+        # Télécharger le fichier source
+        file_stream = smb_client.download_file(source_path)
+        
+        # Uploader vers la destination
+        result = smb_client.upload_file(file_stream, dest_path, filename, overwrite=False)
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur copie: {str(e)}"
+        }), 500
+
+@nas_bp.route('/folder-by-path', methods=['GET'])
+@jwt_required()
+def get_folder_by_path():
+    """Obtenir un dossier de la DB par son chemin"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    if not user or user.role.upper() != 'ADMIN':
+        return jsonify({"error": "Accès réservé aux administrateurs"}), 403
+    
+    folder_path = request.args.get('path', '').strip()
+    folder_path = normalize_smb_path(folder_path)
+    
+    if not folder_path:
+        return jsonify({"error": "Chemin requis"}), 400
+
+    try:
+        folder = Folder.query.filter_by(path=folder_path).first()
+        if folder:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "id": folder.id,
+                    "name": folder.name,
+                    "path": folder.path,
+                    "permissions": [
+                        {
+                            "id": p.id,
+                            "target_name": p.user.username if p.user else p.group.name,
+                            "type": "user" if p.user else "group",
+                            "can_read": p.can_read,
+                            "can_write": p.can_write,
+                            "can_delete": p.can_delete,
+                            "can_share": p.can_share
+                        }
+                        for p in folder.permissions
+                    ]
+                }
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": "Folder not found in database"
+            }), 404
+            
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur recherche dossier: {str(e)}"
+        }), 500
+
+@nas_bp.route('/create-folder-db', methods=['POST'])
+@jwt_required()
+def create_folder_in_db():
+    """Créer un dossier dans la base de données"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    if not user or user.role.upper() != 'ADMIN':
+        return jsonify({"error": "Accès réservé aux administrateurs"}), 403
+    
+    data = request.get_json()
+    folder_name = data.get('name', '').strip()
+    folder_path = normalize_smb_path(data.get('path', '').strip())
+    
+    if not folder_name or not folder_path:
+        return jsonify({"error": "Nom et chemin requis"}), 400
+
+    try:
+        # Vérifier si le dossier existe déjà
+        existing_folder = Folder.query.filter_by(path=folder_path).first()
+        if existing_folder:
+            return jsonify({
+                "success": True,
+                "data": {
+                    "id": existing_folder.id,
+                    "name": existing_folder.name,
+                    "path": existing_folder.path,
+                    "permissions": []
+                }
+            })
+        
+        # Créer le nouveau dossier
+        new_folder = Folder(
+            name=folder_name,
+            path=folder_path,
+            owner_id=user_id
+        )
+        
+        db.session.add(new_folder)
+        db.session.commit()
+        
+        return jsonify({
+            "success": True,
+            "data": {
+                "id": new_folder.id,
+                "name": new_folder.name,
+                "path": new_folder.path,
+                "permissions": []
+            }
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            "success": False,
+            "error": f"Erreur création dossier DB: {str(e)}"
+        }), 500
+
+@nas_bp.route('/properties', methods=['GET'])
+@jwt_required()
+def get_properties():
+    """Obtenir les propriétés d'un fichier ou dossier"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    file_path = request.args.get('path', '').strip()
+    file_path = normalize_smb_path(file_path)
+    
+    if not file_path or not validate_smb_path(file_path):
+        return jsonify({"error": "Chemin invalide"}), 400
+
+    # Vérifier les permissions de lecture
+    parent_path = get_parent_path(file_path)
+    if not check_folder_permission(user, parent_path, 'read'):
+        return jsonify({"error": "Permission de lecture refusée"}), 403
+
+    try:
+        smb_client = get_smb_client()
+        properties = smb_client.get_file_info(file_path)
+        
+        return jsonify({
+            "success": True,
+            "properties": properties
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur propriétés: {str(e)}"
+        }), 500
+
 @nas_bp.route('/test-connection', methods=['GET'])
 @jwt_required()
 def test_connection():
@@ -704,6 +945,12 @@ def browse_directory():
         })
         
     except Exception as e:
+        print(f"❌ Erreur browse_directory pour {path}: {str(e)}")
+        
+        # Log détaillé pour debug
+        import traceback
+        traceback.print_exc()
+        
         return jsonify({
             "success": False,
             "error": f"Erreur navigation: {str(e)}"
@@ -921,7 +1168,8 @@ def delete_item():
             "error": f"Erreur suppression: {str(e)}"
         }), 500
 
-@nas_bp.route('/rename', methods=['PUT'])
+@nas_bp.route('/rename', methods=['PUT', 'POST'])
+@nas_bp.route('/rename-item', methods=['PUT', 'POST'])
 @jwt_required()
 def rename_item():
     """Renommage de fichier ou dossier avec vérification des permissions"""
@@ -990,7 +1238,7 @@ def rename_item():
             "error": f"Erreur renommage: {str(e)}"
         }), 500
 
-@nas_bp.route('/move', methods=['POST'])
+@nas_bp.route('/move', methods=['PUT'])
 @jwt_required()
 def move_item():
     """Déplacement de fichier ou dossier avec vérification des permissions"""
@@ -1067,4 +1315,43 @@ def move_item():
         return jsonify({
             "success": False,
             "error": f"Erreur déplacement: {str(e)}"
+        }), 500
+
+@nas_bp.route('/permissions/check', methods=['GET'])
+@jwt_required()
+def check_path_permissions():
+    """Vérifier les permissions d'un utilisateur sur un chemin spécifique"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    path = request.args.get('path', '').strip()
+    if not path:
+        return jsonify({"error": "Chemin requis"}), 400
+    
+    path = normalize_smb_path(path)
+    
+    if not validate_smb_path(path):
+        return jsonify({"error": "Chemin invalide"}), 400
+    
+    try:
+        # Vérifier toutes les permissions
+        permissions = {
+            'can_read': check_folder_permission(user, path, 'read'),
+            'can_write': check_folder_permission(user, path, 'write'),
+            'can_delete': check_folder_permission(user, path, 'delete'),
+            'can_share': check_folder_permission(user, path, 'share'),
+            'can_modify': check_folder_permission(user, path, 'write')  # Alias pour write
+        }
+        
+        return jsonify({
+            "success": True,
+            "path": path,
+            "permissions": permissions,
+            "is_admin": user.role.upper() == 'ADMIN'
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur vérification permissions: {str(e)}"
         }), 500

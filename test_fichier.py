@@ -1,25 +1,42 @@
-# smb_test.py
-from smb.SMBConnection import SMBConnection
+from smbprotocol.connection import Connection
+from smbprotocol.session import Session
+from smbprotocol.tree import TreeConnect
+from smbprotocol.open import Open, CreateOptions, FileAttributes
+from smbprotocol.file_info import FileDirectoryInformation
+
+import uuid
 
 # ================= CONFIGURATION =================
-username = 'gestion'       # ton login SMB
-password = 'Aeronav99'      # ton mot de passe SMB
-client_name = 'admin'           # nom de ton PC (n'importe quoi)
-server_name = 'NAS_SERVER'          # nom NetBIOS du NAS (ou IP)
-server_ip = '10.61.17.33'         # IP du NAS
-shared_folder = 'NAS'           # nom du dossier partagé SMB
-domain_name = ''                     # laisse vide si pas de domaine
+username = "gestion"
+password = "Aeronav99"
+server_ip = "10.61.17.33"
+server_name = "SERVER"
+shared_folder = "NAS"
+client_name = "admin"
+server_port = 445
 
 # ================== CONNEXION ==================
-conn = SMBConnection(username, password, client_name, server_name, domain=domain_name, use_ntlm_v2=True, is_direct_tcp=True)
-# assert conn.connect(server_ip, 139), "Connexion échouée !"  # port 139 ou 445 selon le NAS
+conn = Connection(uuid.uuid4(), server_ip, server_port)
+conn.connect()
 
-if conn.connect(server_ip, 445):
-    print("Connexion réussie !")
+session = Session(conn, username, password)
+session.connect()
 
-    # Lister les fichiers du partage
-    files = conn.listPath(shared_folder, '/')
-    for f in files:
-        print(f.filename, "<DIR>" if f.isDirectory else f.file_size)
-else:
-    print("Connexion échouée !")
+tree = TreeConnect(session, r"\\{}\{}".format(server_ip, shared_folder))
+tree.connect()
+
+# ================== LISTER LE CONTENU ==================
+root_open = Open(tree, "/")
+root_open.create(
+    impersonation_level=None,       # pas obligatoire si SMB2/3
+    desired_access=FileAttributes.FILE_READ_ATTRIBUTES,  # lecture de l’attribut
+    file_attributes=FileAttributes.FILE_ATTRIBUTE_DIRECTORY,
+    share_access=0,
+    create_disposition=1,           # FILE_OPEN
+    create_options=CreateOptions.FILE_DIRECTORY_FILE
+)
+
+for f in root_open.query_directory("*", file_information_class=FileDirectoryInformation):
+    name = f['FileName'].get_value()
+    is_dir = f['FileAttributes'].get_value() & FileAttributes.FILE_ATTRIBUTE_DIRECTORY
+    print(name, "<DIR>" if is_dir else "FILE")
