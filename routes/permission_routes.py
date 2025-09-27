@@ -11,6 +11,11 @@ from models.file_permission import FilePermission
 from models.folder_permission import FolderPermission
 from extensions import db
 from functools import wraps
+from utils.access_logger import (
+    log_folder_permission_action, 
+    log_file_permission_action, 
+    log_batch_permission_action
+)
 
 permission_bp = Blueprint('permission', __name__, url_prefix='/permissions')
 
@@ -199,8 +204,8 @@ def set_folder_permission(folder_id, target_type, target_id):
     from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
     try:
         verify_jwt_in_request()
-        user_id = get_jwt_identity()
-        user = User.query.get(user_id)
+        admin_user_id = get_jwt_identity()
+        user = User.query.get(admin_user_id)
         
         if not user or user.role.upper() != 'ADMIN':
             return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
@@ -217,7 +222,39 @@ def set_folder_permission(folder_id, target_type, target_id):
         if target_type not in ['user', 'group']:
             return jsonify({"msg": "target_type doit être 'user' ou 'group'"}), 400
         
+        # Vérifier si c'est une création ou une mise à jour
+        existing_perm = None
+        if target_type == 'user':
+            existing_perm = FolderPermission.query.filter_by(folder_id=folder_id, user_id=target_id).first()
+            target_entity = User.query.get_or_404(target_id)
+            target_name = target_entity.username
+        else:
+            existing_perm = FolderPermission.query.filter_by(folder_id=folder_id, group_id=target_id).first()
+            target_entity = Group.query.get_or_404(target_id)
+            target_name = target_entity.name
+        
+        is_creation = existing_perm is None
+        
         perm = set_permission(folder, target_type, target_id, data)
+        
+        # Enregistrer le log d'accès
+        action = 'CREATE_PERMISSION' if is_creation else 'UPDATE_PERMISSION'
+        permissions_data = {
+            'can_read': perm.can_read,
+            'can_write': perm.can_write,
+            'can_delete': perm.can_delete,
+            'can_share': perm.can_share
+        }
+        
+        log_folder_permission_action(
+            admin_user_id, 
+            action, 
+            folder.name, 
+            target_type, 
+            target_name, 
+            permissions_data
+        )
+        
         db.session.commit()
         
         return jsonify({
@@ -239,7 +276,28 @@ def set_folder_permission(folder_id, target_type, target_id):
 @admin_required
 def delete_folder_permission(folder_id, permission_id):
     perm = FolderPermission.query.filter_by(id=permission_id, folder_id=folder_id).first_or_404()
+    
+    # Récupérer les informations avant suppression pour le log
+    folder = Folder.query.get_or_404(folder_id)
+    admin_user_id = get_jwt_identity()
+    
+    if perm.user_id:
+        target_type = 'user'
+        target_name = perm.user.username if perm.user else f'User {perm.user_id}'
+    else:
+        target_type = 'group'
+        target_name = perm.group.name if perm.group else f'Group {perm.group_id}'
+    
     try:
+        # Enregistrer le log avant suppression
+        log_folder_permission_action(
+            admin_user_id,
+            'DELETE_PERMISSION',
+            folder.name,
+            target_type,
+            target_name
+        )
+        
         db.session.delete(perm)
         db.session.commit()
         return jsonify({"msg": "Permission supprimée avec succès"}), 200
@@ -289,16 +347,54 @@ def set_file_permission(file_id, target_type, target_id):
     from flask_jwt_extended import verify_jwt_in_request
     try:
         verify_jwt_in_request()
+        admin_user_id = get_jwt_identity()
         claims = get_jwt()
         if claims.get('role') != 'ADMIN':
             return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
     except Exception as e:
         return jsonify({"msg": "Token d'authentification requis"}), 401
-    file = File.query.get_or_404(file_id)
-    data = request.get_json()
-    perm = set_permission(file, target_type, target_id, data)
-
+        
     try:
+        file = File.query.get_or_404(file_id)
+        data = request.get_json() or {}
+        
+        # Validate target_type
+        if target_type not in ['user', 'group']:
+            return jsonify({"msg": "target_type doit être 'user' ou 'group'"}), 400
+        
+        # Vérifier si c'est une création ou une mise à jour
+        existing_perm = None
+        if target_type == 'user':
+            existing_perm = FilePermission.query.filter_by(file_id=file_id, user_id=target_id).first()
+            target_entity = User.query.get_or_404(target_id)
+            target_name = target_entity.username
+        else:
+            existing_perm = FilePermission.query.filter_by(file_id=file_id, group_id=target_id).first()
+            target_entity = Group.query.get_or_404(target_id)
+            target_name = target_entity.name
+        
+        is_creation = existing_perm is None
+        
+        perm = set_permission(file, target_type, target_id, data)
+        
+        # Enregistrer le log d'accès
+        action = 'CREATE_PERMISSION' if is_creation else 'UPDATE_PERMISSION'
+        permissions_data = {
+            'can_read': perm.can_read,
+            'can_write': perm.can_write,
+            'can_delete': perm.can_delete,
+            'can_share': perm.can_share
+        }
+        
+        log_file_permission_action(
+            admin_user_id,
+            action,
+            file.name,
+            target_type,
+            target_name,
+            permissions_data
+        )
+
         db.session.commit()
         return jsonify({
             "msg": f"Permissions mises à jour pour {target_type} {target_id} sur le fichier {file.name}",
@@ -318,7 +414,28 @@ def set_file_permission(file_id, target_type, target_id):
 @admin_required
 def delete_file_permission(file_id, permission_id):
     perm = FilePermission.query.filter_by(id=permission_id, file_id=file_id).first_or_404()
+    
+    # Récupérer les informations avant suppression pour le log
+    file = File.query.get_or_404(file_id)
+    admin_user_id = get_jwt_identity()
+    
+    if perm.user_id:
+        target_type = 'user'
+        target_name = perm.user.username if perm.user else f'User {perm.user_id}'
+    else:
+        target_type = 'group'
+        target_name = perm.group.name if perm.group else f'Group {perm.group_id}'
+    
     try:
+        # Enregistrer le log avant suppression
+        log_file_permission_action(
+            admin_user_id,
+            'DELETE_PERMISSION',
+            file.name,
+            target_type,
+            target_name
+        )
+        
         db.session.delete(perm)
         db.session.commit()
         return jsonify({"msg": "Permission supprimée avec succès"}), 200
@@ -344,6 +461,14 @@ def batch_set_permissions(entity):
     if not ids or not target_type or not target_id:
         return jsonify({"msg": "Données incomplètes"}), 400
 
+    # Récupérer le nom de la cible pour le log
+    if target_type == 'user':
+        target_entity = User.query.get_or_404(target_id)
+        target_name = target_entity.username
+    else:
+        target_entity = Group.query.get_or_404(target_id)
+        target_name = target_entity.name
+
     success_count = 0
     errors = []
 
@@ -360,6 +485,17 @@ def batch_set_permissions(entity):
             errors.append(f"{entity[:-1]} {item_id}: {str(e)}")
 
     try:
+        # Enregistrer le log pour l'opération en lot
+        admin_user_id = get_jwt_identity()
+        log_batch_permission_action(
+            admin_user_id,
+            entity,
+            success_count,
+            target_type,
+            target_name,
+            perms
+        )
+        
         db.session.commit()
         return jsonify({
             "msg": f"Permissions mises à jour sur {success_count} {entity}",

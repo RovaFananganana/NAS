@@ -10,6 +10,7 @@ from models.file import File
 from models.access_log import AccessLog
 from extensions import db
 from functools import wraps
+from utils.access_logger import log_permission_action
 from datetime import datetime, timezone
 from services.file_storage_service import FileStorageService
 
@@ -355,6 +356,35 @@ def get_access_logs():
             'timestamp': log.timestamp.isoformat()
         })
     return jsonify({'logs': logs_data, 'total': logs.total, 'pages': logs.pages, 'current_page': logs.page}), 200
+
+@admin_bp.route('/test-permission-log', methods=['POST'])
+@admin_required
+def test_permission_log():
+    """Route de test pour vérifier que les logs de permissions fonctionnent"""
+    try:
+        admin_user_id = get_jwt_identity()
+        
+        # Créer un log de test
+        log_permission_action(
+            admin_user_id,
+            'TEST_PERMISSION',
+            'Test de fonctionnement des logs de permissions',
+            'Ceci est un test pour vérifier que les logs de permissions sont bien enregistrés'
+        )
+        
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Log de test créé avec succès'
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({
+            'success': False,
+            'error': f'Erreur lors de la création du log de test: {str(e)}'
+        }), 500
 
 @admin_bp.route('/stats', methods=['GET'])
 @admin_required

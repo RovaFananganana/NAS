@@ -28,6 +28,7 @@ from utils.nas_utils import (
 from utils.permissions import PermissionSet
 from services.permission_optimizer import PermissionOptimizer
 from services.nas_sync_service import nas_sync_service
+from utils.access_logger import log_file_operation
 
 load_dotenv()
 
@@ -359,6 +360,110 @@ permission_optimizer = PermissionOptimizer()
 
 # ================== GESTION DES PERMISSIONS ==================
 
+def check_file_permission(user, file_path, required_action='read'):
+    """
+    Vérifie les permissions d'un utilisateur sur un fichier spécifique
+    Actions possibles: 'read', 'write', 'delete', 'share'
+    """
+    if user.role.upper() == 'ADMIN':
+        return True
+
+    normalized_path = normalize_smb_path(file_path)
+    
+    try:
+        # Chercher le fichier correspondant dans la DB
+        file_obj = File.query.filter_by(path=normalized_path).first()
+        if file_obj:
+            # Vérifier les permissions directes sur le fichier
+            from models.file_permission import FilePermission
+            
+            # Permissions utilisateur directes
+            user_perm = FilePermission.query.filter_by(file_id=file_obj.id, user_id=user.id).first()
+            if user_perm:
+                if required_action == 'read' and user_perm.can_read:
+                    return True
+                elif required_action == 'write' and user_perm.can_write:
+                    return True
+                elif required_action == 'delete' and user_perm.can_delete:
+                    return True
+                elif required_action == 'share' and user_perm.can_share:
+                    return True
+            
+            # Permissions via les groupes
+            for group in user.groups:
+                group_perm = FilePermission.query.filter_by(file_id=file_obj.id, group_id=group.id).first()
+                if group_perm:
+                    if required_action == 'read' and group_perm.can_read:
+                        return True
+                    elif required_action == 'write' and group_perm.can_write:
+                        return True
+                    elif required_action == 'delete' and group_perm.can_delete:
+                        return True
+                    elif required_action == 'share' and group_perm.can_share:
+                        return True
+        
+        # Si pas de permissions spécifiques sur le fichier, vérifier les permissions du dossier parent
+        parent_path = get_parent_path(normalized_path)
+        return check_folder_permission(user, parent_path, required_action)
+        
+    except Exception as e:
+        print(f"Erreur vérification permission fichier {required_action} pour {user.username} sur {file_path}: {str(e)}")
+        # En cas d'erreur, refuser l'accès par sécurité
+        return False
+
+def get_all_accessible_folders(user):
+    """
+    Récupère tous les dossiers auxquels l'utilisateur a accès, 
+    même s'ils sont dans des parents non accessibles
+    """
+    accessible_folders = []
+    
+    try:
+        # Récupérer tous les dossiers de la base de données
+        all_folders = Folder.query.all()
+        
+        for folder in all_folders:
+            # Vérifier les permissions directes
+            permissions = permission_optimizer.get_bulk_folder_permissions(user.id, [folder.id])
+            folder_perm = permissions.get(folder.id)
+            
+            if folder_perm and folder_perm.can_read:
+                accessible_folders.append(folder.path)
+        
+        print(f"📁 Dossiers accessibles pour {user.username}: {accessible_folders}")
+        return accessible_folders
+        
+    except Exception as e:
+        print(f"Erreur récupération dossiers accessibles pour {user.username}: {str(e)}")
+        return []
+
+def ensure_root_access(user):
+    """
+    S'assure qu'un utilisateur a au moins accès en lecture à la racine
+    """
+    try:
+        root_folder = Folder.query.filter_by(path='/').first()
+        if not root_folder:
+            # Créer le dossier racine s'il n'existe pas
+            root_folder = Folder(
+                name='Racine',
+                path='/',
+                owner_id=1  # Admin par défaut
+            )
+            db.session.add(root_folder)
+            db.session.commit()
+            print(f"📁 Dossier racine créé pour l'utilisateur {user.username}")
+        
+        # Vérifier si l'utilisateur a des permissions sur la racine
+        permissions = permission_optimizer.get_bulk_folder_permissions(user.id, [root_folder.id])
+        root_perm = permissions.get(root_folder.id)
+        
+        return root_perm is not None and root_perm.can_read
+        
+    except Exception as e:
+        print(f"Erreur vérification accès racine pour {user.username}: {str(e)}")
+        return False
+
 def check_folder_permission(user, path, required_action='read'):
     """
     Vérifie les permissions d'un utilisateur sur un chemin via la base de données
@@ -406,13 +511,18 @@ def check_folder_permission(user, path, required_action='read'):
                 elif required_action == 'share':
                     return root_perm.can_share
         
-        # Par défaut, autoriser la lecture pour les utilisateurs authentifiés
-        return required_action == 'read'
+        # Par défaut, autoriser la lecture pour les utilisateurs authentifiés sur la racine
+        # mais refuser pour les autres actions ou chemins spécifiques
+        if normalized_path == '/' and required_action == 'read':
+            return True
+        return False
         
     except Exception as e:
         print(f"Erreur vérification permission {required_action} pour {user.username} sur {path}: {str(e)}")
-        # En cas d'erreur, autoriser seulement la lecture
-        return required_action == 'read'
+        # En cas d'erreur, autoriser la lecture sur la racine par défaut pour éviter de bloquer l'accès
+        if required_action == 'read' and normalize_smb_path(path) == '/':
+            return True
+        return False
 
 def sync_folder_to_db(folder_data, parent_folder_id=None, owner_id=1):
     """Synchronise un dossier du NAS vers la DB"""
@@ -923,7 +1033,16 @@ def browse_directory():
         
     # Vérifier les permissions de lecture via la base de données
     if not check_folder_permission(user, path, 'read'):
-        return jsonify({"error": "Accès refusé à ce répertoire"}), 403
+        # Pour la racine, vérifier si l'utilisateur a au moins un accès de base
+        if path == '/' and user.role.upper() != 'ADMIN':
+            has_root_access = ensure_root_access(user)
+            if not has_root_access:
+                return jsonify({
+                    "error": "Aucune permission configurée. Contactez votre administrateur.",
+                    "suggestion": "Vous n'avez accès à aucun dossier. Un administrateur doit vous accorder des permissions."
+                }), 403
+        else:
+            return jsonify({"error": "Accès refusé à ce répertoire"}), 403
 
     try:
         smb_client = get_smb_client()
@@ -932,9 +1051,41 @@ def browse_directory():
         # Filtrer les éléments selon les permissions pour les non-admins
         if user.role.upper() != 'ADMIN':
             accessible_items = []
+            
+            # Ajouter aussi les dossiers accessibles même s'ils sont dans des parents non accessibles
+            if path == '/':
+                # À la racine, ajouter tous les dossiers auxquels l'utilisateur a accès
+                all_accessible_folders = get_all_accessible_folders(user)
+                for folder_path in all_accessible_folders:
+                    # Vérifier si ce dossier est un enfant direct de la racine
+                    if folder_path.count('/') == 1 and folder_path != '/':
+                        # Créer un item virtuel pour ce dossier
+                        folder_name = folder_path.strip('/')
+                        virtual_item = {
+                            'name': folder_name,
+                            'path': folder_path,
+                            'is_directory': True,
+                            'size': 0,
+                            'modified': None,
+                            'created': None,
+                            'mime_type': None
+                        }
+                        # Vérifier qu'il n'est pas déjà dans la liste
+                        if not any(item['path'] == folder_path for item in items):
+                            accessible_items.append(virtual_item)
+            
             for item in items:
-                if check_folder_permission(user, item['path'], 'read'):
-                    accessible_items.append(item)
+                # Vérifier les permissions selon le type d'élément
+                if item['is_directory']:
+                    # Pour les dossiers, vérifier les permissions de dossier
+                    if check_folder_permission(user, item['path'], 'read'):
+                        accessible_items.append(item)
+                else:
+                    # Pour les fichiers, vérifier les permissions de fichier
+                    if check_file_permission(user, item['path'], 'read'):
+                        accessible_items.append(item)
+                        
+            print(f"🔍 Filtrage permissions pour {user.username}: {len(items)} éléments -> {len(accessible_items)} accessibles")
             items = accessible_items
         
         return jsonify({
@@ -983,6 +1134,13 @@ def create_folder():
         result = smb_client.create_folder(parent_path, folder_name)
         
         if result.get('success'):
+            # Enregistrer le log d'accès
+            log_file_operation(
+                user_id, 
+                'CREATE', 
+                f"Dossier '{folder_name}' dans '{parent_path}'"
+            )
+            
             # Synchroniser avec la DB
             try:
                 parent_folder = Folder.query.filter_by(path=parent_path).first()
@@ -1036,6 +1194,16 @@ def upload_file():
         result = smb_client.upload_file(file_obj, dest_path, file_obj.filename, overwrite)
         
         if result.get('success'):
+            # Enregistrer le log d'accès
+            file_size = file_obj.content_length or 0
+            size_mb = round(file_size / (1024 * 1024), 2) if file_size > 0 else 0
+            log_file_operation(
+                user_id, 
+                'UPLOAD', 
+                f"Fichier '{result['name']}' dans '{dest_path}'",
+                f"Taille: {size_mb} MB"
+            )
+            
             # Synchroniser avec la DB
             try:
                 folder = Folder.query.filter_by(path=dest_path).first()
@@ -1084,6 +1252,13 @@ def download_file(file_path):
         file_stream = smb_client.download_file(file_path)
         filename = get_filename_from_path(file_path)
         mime_type = get_file_mime_type(filename)
+
+        # Enregistrer le log d'accès
+        log_file_operation(
+            user_id, 
+            'DOWNLOAD', 
+            f"Fichier '{filename}' depuis '{get_parent_path(file_path)}'"
+        )
 
         def generate():
             chunk_size = 8192
@@ -1169,11 +1344,21 @@ def delete_item():
             "error": f"Erreur suppression: {str(e)}"
         }), 500
 
-@nas_bp.route('/rename', methods=['PUT', 'POST'])
-@nas_bp.route('/rename-item', methods=['PUT', 'POST'])
-@jwt_required()
+@nas_bp.route('/rename', methods=['PUT', 'POST', 'OPTIONS'])
+@nas_bp.route('/rename-item', methods=['PUT', 'POST', 'OPTIONS'])
 def rename_item():
     """Renommage de fichier ou dossier avec vérification des permissions"""
+    # Gérer les requêtes OPTIONS pour CORS
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
+    # Appliquer JWT seulement pour les requêtes non-OPTIONS
+    from flask_jwt_extended import verify_jwt_in_request
+    try:
+        verify_jwt_in_request()
+    except Exception as e:
+        return jsonify({"msg": "Token d'authentification requis"}), 401
+    
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     
@@ -1188,14 +1373,31 @@ def rename_item():
         return jsonify({"error": "Chemin source invalide"}), 400
 
     # Vérifier les permissions d'écriture via la base de données
-    if not check_folder_permission(user, old_path, 'write'):
-        return jsonify({"error": "Permission d'écriture refusée pour le renommage"}), 403
+    # Déterminer si c'est un fichier ou un dossier
+    is_file = '.' in old_path.split('/')[-1]  # Simple heuristique
+    
+    if is_file:
+        # Pour les fichiers, vérifier les permissions de fichier
+        if not check_file_permission(user, old_path, 'write'):
+            return jsonify({"error": "Permission d'écriture refusée pour le renommage de ce fichier"}), 403
+    else:
+        # Pour les dossiers, vérifier les permissions de dossier
+        if not check_folder_permission(user, old_path, 'write'):
+            return jsonify({"error": "Permission d'écriture refusée pour le renommage de ce dossier"}), 403
 
     try:
         smb_client = get_smb_client()
         result = smb_client.rename_file(old_path, new_name)
         
         if result.get('success'):
+            # Enregistrer le log d'accès
+            log_file_operation(
+                user_id,
+                'RENAME',
+                f"'{old_path}' renommé en '{new_name}'",
+                f"Nouveau chemin: {result.get('new_path', 'N/A')}"
+            )
+            
             # Synchroniser avec la DB
             try:
                 # Mettre à jour fichier
@@ -1238,6 +1440,43 @@ def rename_item():
             "success": False,
             "error": f"Erreur renommage: {str(e)}"
         }), 500
+
+@nas_bp.route('/debug/rename', methods=['POST'])
+@jwt_required()
+def debug_rename():
+    """Debug de la fonctionnalité de renommage"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    data = request.get_json() or {}
+    old_path = data.get('old_path', '').strip()
+    new_name = data.get('new_name', '').strip()
+    
+    debug_info = {
+        "user": user.username,
+        "old_path": old_path,
+        "new_name": new_name,
+        "normalized_path": normalize_smb_path(old_path) if old_path else None,
+        "sanitized_name": sanitize_filename(new_name) if new_name else None,
+        "path_valid": validate_smb_path(old_path) if old_path else False,
+        "is_file": '.' in old_path.split('/')[-1] if old_path else False,
+        "permissions": {}
+    }
+    
+    if old_path:
+        is_file = '.' in old_path.split('/')[-1]
+        try:
+            if is_file:
+                debug_info["permissions"]["file_write"] = check_file_permission(user, old_path, 'write')
+            else:
+                debug_info["permissions"]["folder_write"] = check_folder_permission(user, old_path, 'write')
+        except Exception as e:
+            debug_info["permissions"]["error"] = str(e)
+    
+    return jsonify({
+        "success": True,
+        "debug_info": debug_info
+    })
 
 @nas_bp.route('/move', methods=['PUT'])
 @jwt_required()
@@ -1335,26 +1574,182 @@ def check_path_permissions():
         return jsonify({"error": "Chemin invalide"}), 400
     
     try:
-        # Vérifier toutes les permissions
-        permissions = {
-            'can_read': check_folder_permission(user, path, 'read'),
-            'can_write': check_folder_permission(user, path, 'write'),
-            'can_delete': check_folder_permission(user, path, 'delete'),
-            'can_share': check_folder_permission(user, path, 'share'),
-            'can_modify': check_folder_permission(user, path, 'write')  # Alias pour write
-        }
+        # Déterminer si c'est un fichier ou un dossier
+        is_file = '.' in path.split('/')[-1]  # Simple heuristique
+        
+        if is_file:
+            # Vérifier les permissions de fichier
+            permissions = {
+                'can_read': check_file_permission(user, path, 'read'),
+                'can_write': check_file_permission(user, path, 'write'),
+                'can_delete': check_file_permission(user, path, 'delete'),
+                'can_share': check_file_permission(user, path, 'share'),
+                'can_modify': check_file_permission(user, path, 'write')  # Alias pour write
+            }
+        else:
+            # Vérifier les permissions de dossier
+            permissions = {
+                'can_read': check_folder_permission(user, path, 'read'),
+                'can_write': check_folder_permission(user, path, 'write'),
+                'can_delete': check_folder_permission(user, path, 'delete'),
+                'can_share': check_folder_permission(user, path, 'share'),
+                'can_modify': check_folder_permission(user, path, 'write')  # Alias pour write
+            }
         
         return jsonify({
             "success": True,
             "path": path,
             "permissions": permissions,
-            "is_admin": user.role.upper() == 'ADMIN'
+            "is_admin": user.role.upper() == 'ADMIN',
+            "user": user.username,
+            "type": "file" if is_file else "folder"
         })
         
     except Exception as e:
         return jsonify({
             "success": False,
             "error": f"Erreur vérification permissions: {str(e)}"
+        }), 500
+
+@nas_bp.route('/debug/permissions/<int:user_id>', methods=['GET'])
+@jwt_required()
+def debug_user_permissions(user_id):
+    """Debug des permissions d'un utilisateur (Admin uniquement)"""
+    current_user_id = int(get_jwt_identity())
+    current_user = User.query.get(current_user_id)
+    
+    if not current_user or current_user.role.upper() != 'ADMIN':
+        return jsonify({"error": "Accès réservé aux administrateurs"}), 403
+    
+    try:
+        user = User.query.get_or_404(user_id)
+        
+        # Récupérer toutes les permissions de dossiers
+        folder_permissions = []
+        folders = Folder.query.all()
+        for folder in folders:
+            permissions = permission_optimizer.get_bulk_folder_permissions(user.id, [folder.id])
+            folder_perm = permissions.get(folder.id)
+            if folder_perm:
+                folder_permissions.append({
+                    'folder_id': folder.id,
+                    'folder_name': folder.name,
+                    'folder_path': folder.path,
+                    'can_read': folder_perm.can_read,
+                    'can_write': folder_perm.can_write,
+                    'can_delete': folder_perm.can_delete,
+                    'can_share': folder_perm.can_share
+                })
+        
+        # Récupérer toutes les permissions de fichiers
+        file_permissions = []
+        from models.file_permission import FilePermission
+        user_file_perms = FilePermission.query.filter_by(user_id=user.id).all()
+        for perm in user_file_perms:
+            if perm.file:
+                file_permissions.append({
+                    'file_id': perm.file.id,
+                    'file_name': perm.file.name,
+                    'file_path': getattr(perm.file, 'path', 'N/A'),
+                    'can_read': perm.can_read,
+                    'can_write': perm.can_write,
+                    'can_delete': perm.can_delete,
+                    'can_share': perm.can_share
+                })
+        
+        # Permissions via les groupes
+        group_file_permissions = []
+        for group in user.groups:
+            group_file_perms = FilePermission.query.filter_by(group_id=group.id).all()
+            for perm in group_file_perms:
+                if perm.file:
+                    group_file_permissions.append({
+                        'group_name': group.name,
+                        'file_id': perm.file.id,
+                        'file_name': perm.file.name,
+                        'file_path': getattr(perm.file, 'path', 'N/A'),
+                        'can_read': perm.can_read,
+                        'can_write': perm.can_write,
+                        'can_delete': perm.can_delete,
+                        'can_share': perm.can_share
+                    })
+        
+        return jsonify({
+            "success": True,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "role": user.role,
+                "groups": [g.name for g in user.groups]
+            },
+            "folder_permissions": folder_permissions,
+            "file_permissions": file_permissions,
+            "group_file_permissions": group_file_permissions
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur debug permissions: {str(e)}"
+        }), 500
+
+@nas_bp.route('/debug/access-issue', methods=['GET'])
+@jwt_required()
+def debug_access_issue():
+    """Diagnostiquer les problèmes d'accès pour l'utilisateur actuel"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get_or_404(user_id)
+    
+    try:
+        # Vérifier l'accès à la racine
+        root_access = check_folder_permission(user, '/', 'read')
+        root_folder = Folder.query.filter_by(path='/').first()
+        
+        # Compter les permissions de l'utilisateur
+        folder_count = 0
+        file_count = 0
+        
+        if root_folder:
+            permissions = permission_optimizer.get_bulk_folder_permissions(user.id, [root_folder.id])
+            if permissions.get(root_folder.id):
+                folder_count += 1
+        
+        # Compter les permissions de fichiers
+        from models.file_permission import FilePermission
+        user_file_perms = FilePermission.query.filter_by(user_id=user.id).count()
+        
+        # Permissions via les groupes
+        group_folder_count = 0
+        group_file_count = 0
+        for group in user.groups:
+            group_file_count += FilePermission.query.filter_by(group_id=group.id).count()
+        
+        return jsonify({
+            "success": True,
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "role": user.role,
+                "groups": [g.name for g in user.groups]
+            },
+            "access_status": {
+                "root_access": root_access,
+                "root_folder_exists": root_folder is not None,
+                "direct_folder_permissions": folder_count,
+                "direct_file_permissions": user_file_perms,
+                "group_file_permissions": group_file_count
+            },
+            "recommendations": [
+                "Contactez votre administrateur pour obtenir des permissions" if folder_count == 0 and user_file_perms == 0 else None,
+                "Vous avez accès à la racine" if root_access else "Accès à la racine refusé",
+                f"Vous êtes membre de {len(user.groups)} groupe(s)" if user.groups else "Vous n'êtes membre d'aucun groupe"
+            ]
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur diagnostic: {str(e)}"
         }), 500
 
 @nas_bp.route('/sync', methods=['POST'])
