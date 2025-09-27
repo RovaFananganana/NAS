@@ -1350,95 +1350,159 @@ def rename_item():
     """Renommage de fichier ou dossier avec vérification des permissions"""
     # Gérer les requêtes OPTIONS pour CORS
     if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
+        response = jsonify({'status': 'ok'})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+        return response, 200
     
     # Appliquer JWT seulement pour les requêtes non-OPTIONS
     from flask_jwt_extended import verify_jwt_in_request
     try:
         verify_jwt_in_request()
     except Exception as e:
-        return jsonify({"msg": "Token d'authentification requis"}), 401
+        return jsonify({"error": "Token d'authentification requis", "msg": str(e)}), 401
     
-    user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    
-    data = request.get_json()
-    old_path = normalize_smb_path(data.get('old_path', '').strip())
-    new_name = sanitize_filename(data.get('new_name', '').strip())
-
-    if not old_path or not new_name:
-        return jsonify({"error": "Chemin source et nouveau nom requis"}), 400
-        
-    if not validate_smb_path(old_path):
-        return jsonify({"error": "Chemin source invalide"}), 400
-
-    # Vérifier les permissions d'écriture via la base de données
-    # Déterminer si c'est un fichier ou un dossier
-    is_file = '.' in old_path.split('/')[-1]  # Simple heuristique
-    
-    if is_file:
-        # Pour les fichiers, vérifier les permissions de fichier
-        if not check_file_permission(user, old_path, 'write'):
-            return jsonify({"error": "Permission d'écriture refusée pour le renommage de ce fichier"}), 403
-    else:
-        # Pour les dossiers, vérifier les permissions de dossier
-        if not check_folder_permission(user, old_path, 'write'):
-            return jsonify({"error": "Permission d'écriture refusée pour le renommage de ce dossier"}), 403
-
     try:
-        smb_client = get_smb_client()
-        result = smb_client.rename_file(old_path, new_name)
+        user_id = int(get_jwt_identity())
+        user = User.query.get(user_id)
         
-        if result.get('success'):
-            # Enregistrer le log d'accès
-            log_file_operation(
-                user_id,
-                'RENAME',
-                f"'{old_path}' renommé en '{new_name}'",
-                f"Nouveau chemin: {result.get('new_path', 'N/A')}"
-            )
+        if not user:
+            return jsonify({"error": "Utilisateur non trouvé"}), 404
+        
+        # Validation des données d'entrée
+        if not request.is_json:
+            return jsonify({"error": "Content-Type doit être application/json"}), 400
             
-            # Synchroniser avec la DB
-            try:
-                # Mettre à jour fichier
-                file_entry = File.query.filter_by(path=old_path).first()
-                if file_entry:
-                    file_entry.name = new_name
-                    file_entry.path = result['new_path']
-                
-                # Mettre à jour dossier
-                folder_entry = Folder.query.filter_by(path=old_path).first()
-                if folder_entry:
-                    folder_entry.name = new_name
-                    folder_entry.path = result['new_path']
-                    
-                    # Mettre à jour récursivement tous les sous-éléments
-                    def update_paths_recursive(folder, old_base, new_base):
-                        files = File.query.filter_by(folder_id=folder.id).all()
-                        for f in files:
-                            if f.path.startswith(old_base):
-                                f.path = f.path.replace(old_base, new_base, 1)
-                        
-                        subfolders = Folder.query.filter_by(parent_id=folder.id).all()
-                        for sf in subfolders:
-                            if sf.path.startswith(old_base):
-                                sf.path = sf.path.replace(old_base, new_base, 1)
-                                update_paths_recursive(sf, old_base, new_base)
-                    
-                    update_paths_recursive(folder_entry, old_path, result['new_path'])
-                
-                db.session.commit()
-                
-            except Exception as sync_error:
-                print(f"Erreur synchronisation renommage DB: {str(sync_error)}")
-                db.session.rollback()
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Données JSON requises"}), 400
+            
+        # Safer data extraction with type checking
+        old_path_raw = data.get('old_path', '')
+        new_name_raw = data.get('new_name', '')
         
-        return jsonify(result)
+        # Ensure we have strings
+        if not isinstance(old_path_raw, str):
+            return jsonify({"error": f"old_path doit être une chaîne, reçu {type(old_path_raw).__name__}"}), 400
+        if not isinstance(new_name_raw, str):
+            return jsonify({"error": f"new_name doit être une chaîne, reçu {type(new_name_raw).__name__}"}), 400
+            
+        old_path = old_path_raw.strip()
+        new_name = new_name_raw.strip()
+
+        if not old_path or not new_name:
+            return jsonify({"error": "Chemin source et nouveau nom requis"}), 400
+            
+        # Normaliser et valider les chemins
+        try:
+            old_path = normalize_smb_path(old_path)
+            new_name = sanitize_filename(new_name)
+        except Exception as e:
+            return jsonify({"error": f"Erreur de validation des chemins: {str(e)}"}), 400
+            
+        if not validate_smb_path(old_path):
+            return jsonify({"error": "Chemin source invalide"}), 400
+            
+        # Vérifications supplémentaires
+        if not new_name or new_name.strip() == '':
+            return jsonify({"error": "Le nouveau nom ne peut pas être vide"}), 400
+            
+        if len(new_name) > 255:
+            return jsonify({"error": "Le nom est trop long (maximum 255 caractères)"}), 400
+            
+        # Vérifier que le nouveau nom est différent de l'ancien
+        current_name = old_path.split('/')[-1]
+        if new_name == current_name:
+            return jsonify({"error": "Le nouveau nom doit être différent de l'ancien"}), 400
+
+        # Vérifier les permissions d'écriture via la base de données
+        # Déterminer si c'est un fichier ou un dossier
+        is_file = '.' in old_path.split('/')[-1]  # Simple heuristique
+        
+        try:
+            if is_file:
+                # Pour les fichiers, vérifier les permissions de fichier
+                if not check_file_permission(user, old_path, 'write'):
+                    return jsonify({"error": "Permission d'écriture refusée pour le renommage de ce fichier"}), 403
+            else:
+                # Pour les dossiers, vérifier les permissions de dossier
+                if not check_folder_permission(user, old_path, 'write'):
+                    return jsonify({"error": "Permission d'écriture refusée pour le renommage de ce dossier"}), 403
+        except Exception as perm_error:
+            print(f"Erreur vérification permissions: {str(perm_error)}")
+            return jsonify({"error": "Erreur lors de la vérification des permissions"}), 500
+
+        # Effectuer le renommage
+        try:
+            smb_client = get_smb_client()
+            result = smb_client.rename_file(old_path, new_name)
+            
+            if result.get('success'):
+                # Enregistrer le log d'accès
+                try:
+                    log_file_operation(
+                        user_id,
+                        'RENAME',
+                        f"'{old_path}' renommé en '{new_name}'",
+                        f"Nouveau chemin: {result.get('new_path', 'N/A')}"
+                    )
+                except Exception as log_error:
+                    print(f"Erreur log d'accès: {str(log_error)}")
+                
+                # Synchroniser avec la DB
+                try:
+                    # Mettre à jour fichier
+                    file_entry = File.query.filter_by(path=old_path).first()
+                    if file_entry:
+                        file_entry.name = new_name
+                        file_entry.path = result['new_path']
+                    
+                    # Mettre à jour dossier
+                    folder_entry = Folder.query.filter_by(path=old_path).first()
+                    if folder_entry:
+                        folder_entry.name = new_name
+                        folder_entry.path = result['new_path']
+                        
+                        # Mettre à jour récursivement tous les sous-éléments
+                        def update_paths_recursive(folder, old_base, new_base):
+                            try:
+                                files = File.query.filter_by(folder_id=folder.id).all()
+                                for f in files:
+                                    if f.path.startswith(old_base):
+                                        f.path = f.path.replace(old_base, new_base, 1)
+                                
+                                subfolders = Folder.query.filter_by(parent_id=folder.id).all()
+                                for sf in subfolders:
+                                    if sf.path.startswith(old_base):
+                                        sf.path = sf.path.replace(old_base, new_base, 1)
+                                        update_paths_recursive(sf, old_base, new_base)
+                            except Exception as recursive_error:
+                                print(f"Erreur mise à jour récursive: {str(recursive_error)}")
+                        
+                        update_paths_recursive(folder_entry, old_path, result['new_path'])
+                    
+                    db.session.commit()
+                    
+                except Exception as sync_error:
+                    print(f"Erreur synchronisation renommage DB: {str(sync_error)}")
+                    db.session.rollback()
+                    # Ne pas faire échouer le renommage si la sync DB échoue
+            
+            return jsonify(result)
+            
+        except Exception as smb_error:
+            print(f"Erreur SMB renommage: {str(smb_error)}")
+            return jsonify({
+                "success": False,
+                "error": f"Erreur lors du renommage: {str(smb_error)}"
+            }), 500
         
     except Exception as e:
+        print(f"Erreur générale renommage: {str(e)}")
         return jsonify({
             "success": False,
-            "error": f"Erreur renommage: {str(e)}"
+            "error": f"Erreur interne du serveur: {str(e)}"
         }), 500
 
 @nas_bp.route('/debug/rename', methods=['POST'])
