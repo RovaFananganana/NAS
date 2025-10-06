@@ -486,6 +486,32 @@ def get_accessible_resources():
         }
     }), 200
 
+@user_bp.route('/log-activity', methods=['POST'])
+@jwt_required()
+def log_activity():
+    """Enregistre une activité utilisateur dans les logs"""
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('action') or not data.get('target'):
+            return jsonify({"msg": "Action et target requis"}), 400
+        
+        action = data.get('action')
+        target = data.get('target')
+        details = data.get('details', '')
+        
+        # Construire le target avec les détails si fournis
+        log_target = f"{target} - {details}" if details else target
+        
+        # Enregistrer l'activité
+        log_user_action(action, log_target)
+        
+        return jsonify({"msg": "Activité enregistrée avec succès"}), 200
+        
+    except Exception as e:
+        print(f"Erreur lors de l'enregistrement de l'activité: {str(e)}")
+        return jsonify({"msg": "Erreur lors de l'enregistrement"}), 500
+
 @user_bp.route('/folders/<int:folder_id>/content', methods=['GET'])
 @require_resource_permission('folder', 'read')
 def get_folder_content(folder_id):

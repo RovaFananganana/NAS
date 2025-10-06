@@ -226,6 +226,41 @@ class SMBClientNAS:
             except Exception as e2:
                 raise Exception(f"Impossible de supprimer {path}: {str(e2)}")
 
+    def delete_file_recursive(self, path):
+        """Supprime un fichier ou dossier de manière récursive (pour les admins)"""
+        self._ensure_connected()
+        path = normalize_smb_path(path)
+        
+        if not validate_smb_path(path):
+            raise ValueError(f"Chemin invalide: {path}")
+        
+        try:
+            # Vérifier si c'est un dossier ou un fichier
+            info = self.conn.getAttributes(self.share_name, path)
+            
+            if info.isDirectory:
+                # Supprimer récursivement le contenu du dossier
+                try:
+                    contents = self.conn.listPath(self.share_name, path)
+                    for item in contents:
+                        if item.filename not in [".", ".."]:
+                            item_path = normalize_smb_path(f"{path}/{item.filename}")
+                            self.delete_file_recursive(item_path)  # Récursion
+                except Exception as list_error:
+                    print(f"Erreur lors du listage de {path}: {str(list_error)}")
+                
+                # Maintenant supprimer le dossier vide
+                self.conn.deleteDirectory(self.share_name, path)
+            else:
+                # C'est un fichier, le supprimer directement
+                self.conn.deleteFiles(self.share_name, path)
+            
+            return {"success": True, "message": "Suppression récursive réussie"}
+            
+        except Exception as e:
+            print(f"Erreur suppression récursive {path}: {str(e)}")
+            raise Exception(f"Impossible de supprimer récursivement {path}: {str(e)}")
+
     def rename_file(self, old_path, new_name):
         """Renomme un fichier ou dossier"""
         self._ensure_connected()

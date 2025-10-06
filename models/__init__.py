@@ -9,6 +9,7 @@ from .role_permission import RolePermission
 from .file_permission import FilePermission
 from .folder_permission import FolderPermission
 from .permission_cache import PermissionCache
+from .favorite import Favorite
 
 __all__ = [
     "User",
@@ -21,4 +22,5 @@ __all__ = [
     "RolePermission",
     "FilePermission",
     "FolderPermission",
-    "PermissionCache",]
+    "PermissionCache",
+    "Favorite",]

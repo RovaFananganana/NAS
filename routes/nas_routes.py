@@ -187,6 +187,27 @@ class GlobalSMBClient:
         except Exception as e:
             raise Exception(f"Impossible de créer le dossier {folder_name}: {str(e)}")
 
+    def create_file(self, path, file_name):
+        """Crée un fichier vide"""
+        self._ensure_connected()
+        
+        file_name = sanitize_filename(file_name)
+        file_path = normalize_smb_path(f"{path.rstrip('/')}/{file_name}")
+        
+        try:
+            # Créer un fichier vide en écrivant un contenu vide
+            file_obj = io.BytesIO(b'')
+            self.conn.storeFile(self.shared_folder, file_path, file_obj)
+            
+            return {
+                "success": True,
+                "path": file_path,
+                "name": file_name,
+                "message": "Fichier créé avec succès"
+            }
+        except Exception as e:
+            raise Exception(f"Impossible de créer le fichier {file_name}: {str(e)}")
+
     def upload_file(self, file_obj, dest_path, filename, overwrite=False):
         """Upload un fichier"""
         self._ensure_connected()
@@ -264,6 +285,44 @@ class GlobalSMBClient:
             
         except Exception as e:
             raise Exception(f"Impossible de supprimer {path}: {str(e)}")
+
+    def delete_file_recursive(self, path):
+        """Supprime un fichier ou dossier récursivement (pour les administrateurs)"""
+        self._ensure_connected()
+        
+        try:
+            # Vérifier si c'est un dossier ou un fichier
+            info = self.conn.getAttributes(self.shared_folder, path)
+            
+            if info.isDirectory:
+                # Supprimer récursivement le contenu du dossier
+                try:
+                    contents = self.conn.listPath(self.shared_folder, path)
+                    for item in contents:
+                        if item.filename not in [".", ".."]:
+                            item_path = f"{path.rstrip('/')}/{item.filename}"
+                            if item.isDirectory:
+                                # Récursion pour les sous-dossiers
+                                self.delete_file_recursive(item_path)
+                            else:
+                                # Supprimer le fichier
+                                self.conn.deleteFiles(self.shared_folder, item_path)
+                                print(f"✅ Fichier supprimé: {item_path}")
+                except Exception as list_error:
+                    print(f"⚠️ Erreur listage contenu {path}: {str(list_error)}")
+                
+                # Supprimer le dossier maintenant qu'il est vide
+                self.conn.deleteDirectory(self.shared_folder, path)
+                print(f"✅ Dossier supprimé: {path}")
+            else:
+                # C'est un fichier, le supprimer directement
+                self.conn.deleteFiles(self.shared_folder, path)
+                print(f"✅ Fichier supprimé: {path}")
+            
+            return {"success": True, "message": "Suppression récursive réussie"}
+            
+        except Exception as e:
+            raise Exception(f"Impossible de supprimer récursivement {path}: {str(e)}")
 
     def rename_file(self, old_path, new_name):
         """Renomme un fichier ou dossier"""
@@ -469,7 +528,8 @@ def check_folder_permission(user, path, required_action='read'):
     Vérifie les permissions d'un utilisateur sur un chemin via la base de données
     Actions possibles: 'read', 'write', 'delete', 'share'
     """
-    if user.role.upper() == 'ADMIN':
+    # Admin users have all permissions
+    if user and user.role and user.role.upper() in ['ADMIN', 'ADMINISTRATOR']:
         return True
 
     normalized_path = normalize_smb_path(path)
@@ -582,7 +642,14 @@ def health_check():
 @jwt_required()
 def copy_item():
     """Copier un fichier ou dossier"""
-    user_id = int(get_jwt_identity())
+    try:
+        jwt_identity = get_jwt_identity()
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+        user_id = int(jwt_identity)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
+        
     user = User.query.get(user_id)
     
     data = request.get_json()
@@ -628,7 +695,14 @@ def copy_item():
 @jwt_required()
 def get_folder_by_path():
     """Obtenir un dossier de la DB par son chemin"""
-    user_id = int(get_jwt_identity())
+    try:
+        jwt_identity = get_jwt_identity()
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+        user_id = int(jwt_identity)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
+        
     user = User.query.get(user_id)
     
     if not user or user.role.upper() != 'ADMIN':
@@ -1019,7 +1093,14 @@ def force_sync():
 @jwt_required()
 def browse_directory():
     """Navigation dans l'arborescence du NAS avec vérification des permissions backend"""
-    user_id = int(get_jwt_identity())
+    try:
+        jwt_identity = get_jwt_identity()
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+        user_id = int(jwt_identity)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
+        
     user = User.query.get(user_id)
     
     if not user:
@@ -1165,6 +1246,65 @@ def create_folder():
             "error": f"Erreur création dossier: {str(e)}"
         }), 500
 
+@nas_bp.route('/create-file', methods=['POST'])
+@jwt_required()
+def create_file():
+    """Création d'un nouveau fichier vide avec vérification des permissions"""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    
+    data = request.get_json()
+    parent_path = normalize_smb_path(data.get('parent_path', '/'))
+    file_name = sanitize_filename(data.get('name', '').strip())
+
+    if not file_name:
+        return jsonify({"error": "Le nom du fichier est requis"}), 400
+        
+    if not validate_smb_path(parent_path):
+        return jsonify({"error": "Chemin parent invalide"}), 400
+    
+    # Vérifier les permissions d'écriture via la base de données
+    if not check_folder_permission(user, parent_path, 'write'):
+        return jsonify({"error": "Permission d'écriture refusée sur ce dossier"}), 403
+
+    try:
+        smb_client = get_smb_client()
+        result = smb_client.create_file(parent_path, file_name)
+        
+        if result.get('success'):
+            # Enregistrer le log d'accès
+            log_file_operation(
+                user_id, 
+                'CREATE', 
+                f"Fichier '{file_name}' dans '{parent_path}'"
+            )
+            
+            # Synchroniser avec la DB si nécessaire
+            try:
+                parent_folder = Folder.query.filter_by(path=parent_path).first()
+                parent_id = parent_folder.id if parent_folder else None
+                
+                file_data = {
+                    'name': file_name,
+                    'path': result['path'],
+                    'size': 0,  # Fichier vide
+                    'mime_type': get_file_mime_type(file_name)
+                }
+                
+                sync_file_to_db(file_data, parent_id, user.id)
+                db.session.commit()
+                
+            except Exception as sync_error:
+                print(f"Erreur synchronisation DB: {str(sync_error)}")
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": f"Erreur création fichier: {str(e)}"
+        }), 500
+
 @nas_bp.route('/upload', methods=['POST'])
 @jwt_required()
 def upload_file():
@@ -1230,10 +1370,25 @@ def upload_file():
             "error": f"Erreur upload: {str(e)}"
         }), 500
 
-@nas_bp.route('/download/<path:file_path>', methods=['GET'])
-@jwt_required()
+@nas_bp.route('/download/<path:file_path>', methods=['GET', 'OPTIONS'])
 def download_file(file_path):
     """Téléchargement de fichier avec vérification des permissions"""
+    
+    # Handle CORS preflight
+    if request.method == 'OPTIONS':
+        response = Response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        return response
+    
+    # Apply JWT only for non-OPTIONS requests
+    from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
+    try:
+        verify_jwt_in_request()
+    except Exception as e:
+        return jsonify({"error": "Token d'authentification requis"}), 401
+    
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     
@@ -1242,6 +1397,12 @@ def download_file(file_path):
     
     if not validate_smb_path(file_path):
         return jsonify({"error": "Chemin de fichier invalide"}), 400
+    
+    # Skip system files that might cause issues
+    filename = get_filename_from_path(file_path)
+    system_files = ['desktop.ini', 'thumbs.db', '.ds_store', 'folder.jpg', 'albumartsmall.jpg']
+    if filename.lower() in system_files:
+        return jsonify({"error": "Les fichiers système ne peuvent pas être téléchargés"}), 403
 
     # Vérifier les permissions de lecture via la base de données
     if not check_folder_permission(user, get_parent_path(file_path), 'read'):
@@ -1249,15 +1410,25 @@ def download_file(file_path):
 
     try:
         smb_client = get_smb_client()
+        
+        # Get file info first to determine size for progress tracking
+        try:
+            file_info = smb_client.get_file_info(file_path)
+            file_size = file_info.get('size', 0) if file_info else 0
+        except:
+            file_size = 0
+        
         file_stream = smb_client.download_file(file_path)
         filename = get_filename_from_path(file_path)
         mime_type = get_file_mime_type(filename)
 
-        # Enregistrer le log d'accès
+        # Enregistrer le log d'accès avec taille du fichier
+        size_info = f"Taille: {round(file_size / (1024 * 1024), 2)} MB" if file_size > 0 else ""
         log_file_operation(
             user_id, 
             'DOWNLOAD', 
-            f"Fichier '{filename}' depuis '{get_parent_path(file_path)}'"
+            f"Fichier '{filename}' depuis '{get_parent_path(file_path)}'",
+            size_info
         )
 
         def generate():
@@ -1269,13 +1440,26 @@ def download_file(file_path):
                 yield chunk
             file_stream.close()
 
-        return Response(
+        headers = {
+            'Content-Disposition': f'attachment; filename="{filename}"',
+            'Content-Type': mime_type
+        }
+        
+        # Add Content-Length header for progress tracking if file size is known
+        if file_size > 0:
+            headers['Content-Length'] = str(file_size)
+
+        response = Response(
             generate(),
-            headers={
-                'Content-Disposition': f'attachment; filename="{filename}"',
-                'Content-Type': mime_type
-            }
+            headers=headers
         )
+        
+        # Add CORS headers
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        
+        return response
         
     except Exception as e:
         return jsonify({
@@ -1287,25 +1471,98 @@ def download_file(file_path):
 @jwt_required()
 def delete_item():
     """Suppression de fichier ou dossier avec vérification des permissions"""
-    user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    try:
+        jwt_identity = get_jwt_identity()
+        print(f"🔍 Delete JWT Identity type: {type(jwt_identity)}, value: {jwt_identity}")
+        
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+            
+        user_id = int(jwt_identity)
+        user = User.query.get(user_id)
+        
+        if not user:
+            return jsonify({"error": f"Utilisateur introuvable avec l'ID {user_id}"}), 404
+            
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
     
     data = request.get_json()
-    target_path = normalize_smb_path(data.get('path', '').strip())
-
+    if not data:
+        return jsonify({"error": "Données JSON requises"}), 400
+        
+    raw_path = data.get('path', '')
+    if not raw_path:
+        return jsonify({"error": "Chemin requis dans les données"}), 400
+        
+    target_path = normalize_smb_path(raw_path.strip())
+    recursive = data.get('recursive', False)  # Option for recursive deletion
+    
     if not target_path:
-        return jsonify({"error": "Chemin requis"}), 400
+        return jsonify({"error": "Chemin vide après normalisation"}), 400
         
     if not validate_smb_path(target_path):
-        return jsonify({"error": "Chemin invalide"}), 400
+        return jsonify({
+            "error": "Chemin invalide", 
+            "path": target_path,
+            "raw_path": raw_path
+        }), 400
     
     # Vérifier les permissions de suppression via la base de données
-    if not check_folder_permission(user, target_path, 'delete'):
-        return jsonify({"error": "Permission de suppression refusée"}), 403
+    has_permission = check_folder_permission(user, target_path, 'delete')
+    
+    if not has_permission:
+        return jsonify({
+            "error": "Permission de suppression refusée",
+            "details": f"L'utilisateur {user.username} (rôle: {user.role}) n'a pas les permissions pour supprimer {target_path}"
+        }), 403
 
     try:
         smb_client = get_smb_client()
-        result = smb_client.delete_file(target_path)
+        
+        print(f"🗑️ Tentative de suppression: {target_path} (utilisateur: {user.username}, admin: {user.role.upper() == 'ADMIN'}, récursif: {recursive})")
+        
+        # Vérifier d'abord si le fichier/dossier existe
+        file_exists = True
+        is_directory = False
+        try:
+            file_info = smb_client.get_file_info(target_path)
+            is_directory = file_info.get('is_directory', False)
+            print(f"📁 Élément trouvé: {target_path} (dossier: {is_directory})")
+        except Exception as check_error:
+            print(f"⚠️ Élément non trouvé sur le NAS: {target_path} - {str(check_error)}")
+            file_exists = False
+            
+        # Stratégie de suppression basée sur le rôle et le type
+        if not file_exists:
+            # Si l'élément n'existe pas sur le NAS, on supprime juste de la DB
+            print(f"🗑️ Élément absent du NAS, suppression DB seulement")
+            result = {"success": True, "message": "Suppression de la DB seulement (élément absent du NAS)"}
+        elif user.role.upper() == 'ADMIN':
+            # Admins utilisent toujours la suppression récursive pour éviter les erreurs "not empty"
+            print(f"🔧 Suppression récursive admin pour: {target_path}")
+            try:
+                result = smb_client.delete_file_recursive(target_path)
+                print(f"✅ Suppression récursive réussie: {target_path}")
+            except Exception as delete_error:
+                print(f"⚠️ Erreur suppression récursive NAS: {str(delete_error)}")
+                # Même en cas d'erreur, on continue avec la DB pour les admins
+                result = {"success": True, "message": f"Suppression partielle: {str(delete_error)}"}
+        else:
+            # Utilisateurs normaux utilisent la suppression standard
+            print(f"🔧 Suppression normale pour: {target_path}")
+            try:
+                result = smb_client.delete_file(target_path)
+                print(f"✅ Suppression normale réussie: {target_path}")
+            except Exception as delete_error:
+                error_msg = str(delete_error)
+                print(f"❌ Erreur suppression normale: {error_msg}")
+                
+                # Si c'est un dossier non vide, on informe l'utilisateur
+                if "n'est pas vide" in error_msg.lower() or "not empty" in error_msg.lower():
+                    raise Exception(f"Le dossier '{target_path}' n'est pas vide. Contactez un administrateur pour une suppression récursive.")
+                else:
+                    raise Exception(f"Impossible de supprimer '{target_path}': {error_msg}")
         
         if result.get('success'):
             # Synchroniser avec la DB - supprimer l'entrée
@@ -1339,10 +1596,52 @@ def delete_item():
         return jsonify(result)
         
     except Exception as e:
+        error_message = str(e)
+        status_code = 500
+        
+        print(f"❌ Erreur lors de la suppression de {target_path}: {error_message}")
+        print(f"❌ Type d'erreur: {type(e).__name__}")
+        
+        # Handle specific error cases
+        if "n'est pas vide" in error_message.lower() or "not empty" in error_message.lower():
+            if user.role.upper() == 'ADMIN':
+                # Pour les admins, on devrait pouvoir supprimer récursivement
+                print(f"⚠️ Dossier non vide mais utilisateur admin - tentative de suppression récursive forcée")
+                try:
+                    # Force recursive deletion for admin
+                    smb_client = get_smb_client()
+                    result = smb_client.delete_file_recursive(target_path)
+                    if result.get('success'):
+                        return jsonify(result)
+                except Exception as force_error:
+                    print(f"❌ Échec suppression récursive forcée: {str(force_error)}")
+            
+            status_code = 422
+            error_message = f"Le dossier '{target_path}' n'est pas vide. " + (
+                "Suppression récursive échouée." if user.role.upper() == 'ADMIN' 
+                else "Veuillez d'abord supprimer son contenu ou demander à un administrateur."
+            )
+        elif "permission" in error_message.lower() or "access" in error_message.lower():
+            status_code = 403
+            error_message = "Accès refusé. Vérifiez vos permissions sur le fichier/dossier."
+        elif "not found" in error_message.lower() or "introuvable" in error_message.lower():
+            status_code = 404
+            error_message = "Fichier ou dossier introuvable."
+        elif "impossible de supprimer récursivement" in error_message.lower():
+            status_code = 422
+            error_message = f"Impossible de supprimer récursivement '{target_path}': {error_message}"
+        
         return jsonify({
             "success": False,
-            "error": f"Erreur suppression: {str(e)}"
-        }), 500
+            "error": error_message,
+            "details": {
+                "path": target_path,
+                "user": user.username,
+                "role": user.role,
+                "recursive_attempted": user.role.upper() == 'ADMIN',
+                "original_error": str(e)
+            }
+        }), status_code
 
 @nas_bp.route('/rename', methods=['PUT', 'POST', 'OPTIONS'])
 @nas_bp.route('/rename-item', methods=['PUT', 'POST', 'OPTIONS'])

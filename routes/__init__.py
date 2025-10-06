@@ -9,6 +9,7 @@ from .permission_routes import permission_bp
 from .metrics_routes import metrics_bp
 from .performance import performance_bp
 from .nas_routes import nas_bp
+from .favorites_routes import favorites_bp
 
 def register_blueprints(app):
     app.register_blueprint(auth_bp, url_prefix="/auth")
@@ -20,3 +21,4 @@ def register_blueprints(app):
     app.register_blueprint(metrics_bp, url_prefix="/metrics")
     app.register_blueprint(performance_bp, url_prefix="/api")
     app.register_blueprint(nas_bp, url_prefix="/nas")
+    app.register_blueprint(favorites_bp, url_prefix="/favorites")
