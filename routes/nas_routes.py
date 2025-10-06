@@ -1193,10 +1193,22 @@ def browse_directory():
 @jwt_required()
 def create_folder():
     """Création d'un nouveau dossier avec vérification des permissions"""
-    user_id = int(get_jwt_identity())
+    try:
+        jwt_identity = get_jwt_identity()
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+        user_id = int(jwt_identity)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
+        
     user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": f"Utilisateur introuvable avec l'ID {user_id}"}), 404
     
     data = request.get_json()
+    if not data:
+        return jsonify({"error": "Données JSON requises"}), 400
+        
     parent_path = normalize_smb_path(data.get('parent_path', '/'))
     folder_name = sanitize_filename(data.get('name', '').strip())
 
@@ -1207,7 +1219,9 @@ def create_folder():
         return jsonify({"error": "Chemin parent invalide"}), 400
     
     # Vérifier les permissions d'écriture via la base de données
-    if not check_folder_permission(user, parent_path, 'write'):
+    has_permission = check_folder_permission(user, parent_path, 'write')
+    
+    if not has_permission:
         return jsonify({"error": "Permission d'écriture refusée sur ce dossier"}), 403
 
     try:

@@ -60,12 +60,9 @@ def add_favorite():
         if existing_favorite:
             return jsonify({'error': 'Item is already in favorites'}), 409
         
-        # Verify the file/folder exists on the NAS
-        storage_root = os.getenv('STORAGE_ROOT', '/volume1/homes')
-        full_path = os.path.join(storage_root, item_path.lstrip('/'))
-        
-        if not os.path.exists(full_path):
-            return jsonify({'error': 'Item does not exist on the NAS'}), 404
+        # Note: We don't verify file existence for favorites
+        # This allows users to keep favorites even if files are temporarily unavailable
+        # The cleanup endpoint can remove orphaned favorites later
         
         # Create new favorite
         favorite = Favorite(
@@ -77,6 +74,8 @@ def add_favorite():
         
         db.session.add(favorite)
         db.session.commit()
+        
+        print(f"✅ Favorite added to DB: user_id={current_user_id}, path={item_path}, name={item_name}")
         
         # Log the action
         log_action(current_user_id, 'ADD_FAVORITE', item_path)
@@ -156,22 +155,10 @@ def list_favorites():
         # Get all favorites for the user
         favorites = Favorite.query.filter_by(user_id=current_user_id).order_by(Favorite.created_at.desc()).all()
         
-        # Verify each favorite still exists and clean up orphans
-        valid_favorites = []
-        storage_root = os.getenv('STORAGE_ROOT', '/volume1/homes')
+        print(f"📋 Found {len(favorites)} favorites in DB for user {current_user_id}")
         
-        for favorite in favorites:
-            full_path = os.path.join(storage_root, favorite.item_path.lstrip('/'))
-            
-            if os.path.exists(full_path):
-                valid_favorites.append(favorite.to_dict())
-            else:
-                # Remove orphaned favorite
-                db.session.delete(favorite)
-        
-        # Commit any orphan cleanup
-        if len(valid_favorites) < len(favorites):
-            db.session.commit()
+        # Convert to dict format (no orphan cleanup here - use dedicated cleanup endpoint)
+        valid_favorites = [favorite.to_dict() for favorite in favorites]
         
         return jsonify({
             'favorites': valid_favorites,
