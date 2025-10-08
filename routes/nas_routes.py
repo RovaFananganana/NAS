@@ -1236,7 +1236,7 @@ def create_folder():
                 f"Dossier '{folder_name}' dans '{parent_path}'"
             )
             
-            # Synchroniser avec la DB
+            # Synchroniser avec la DB et créer les permissions
             try:
                 parent_folder = Folder.query.filter_by(path=parent_path).first()
                 parent_id = parent_folder.id if parent_folder else None
@@ -1246,11 +1246,36 @@ def create_folder():
                     'path': result['path']
                 }
                 
-                sync_folder_to_db(folder_data, parent_id, user.id)
+                folder_id = sync_folder_to_db(folder_data, parent_id, user.id)
+                
+                # Créer automatiquement toutes les permissions pour l'utilisateur créateur
+                if folder_id:
+                    from models.folder_permission import FolderPermission
+                    
+                    # Vérifier si les permissions existent déjà
+                    existing_perm = FolderPermission.query.filter_by(
+                        folder_id=folder_id, 
+                        user_id=user.id
+                    ).first()
+                    
+                    if not existing_perm:
+                        # Créer les permissions complètes pour le créateur
+                        creator_permission = FolderPermission(
+                            folder_id=folder_id,
+                            user_id=user.id,
+                            can_read=True,
+                            can_write=True,
+                            can_delete=True,
+                            can_share=True
+                        )
+                        db.session.add(creator_permission)
+                        print(f"✅ Permissions complètes créées pour l'utilisateur {user.username} sur le dossier {folder_name}")
+                
                 db.session.commit()
                 
             except Exception as sync_error:
                 print(f"Erreur synchronisation DB: {str(sync_error)}")
+                db.session.rollback()
         
         return jsonify(result)
         
@@ -1293,7 +1318,7 @@ def create_file():
                 f"Fichier '{file_name}' dans '{parent_path}'"
             )
             
-            # Synchroniser avec la DB si nécessaire
+            # Synchroniser avec la DB et créer les permissions
             try:
                 parent_folder = Folder.query.filter_by(path=parent_path).first()
                 parent_id = parent_folder.id if parent_folder else None
@@ -1305,11 +1330,36 @@ def create_file():
                     'mime_type': get_file_mime_type(file_name)
                 }
                 
-                sync_file_to_db(file_data, parent_id, user.id)
+                created_file = sync_file_to_db(file_data, parent_id, user.id)
+                
+                # Créer automatiquement toutes les permissions pour l'utilisateur créateur
+                if created_file and hasattr(created_file, 'id'):
+                    from models.file_permission import FilePermission
+                    
+                    # Vérifier si les permissions existent déjà
+                    existing_perm = FilePermission.query.filter_by(
+                        file_id=created_file.id, 
+                        user_id=user.id
+                    ).first()
+                    
+                    if not existing_perm:
+                        # Créer les permissions complètes pour le créateur
+                        creator_permission = FilePermission(
+                            file_id=created_file.id,
+                            user_id=user.id,
+                            can_read=True,
+                            can_write=True,
+                            can_delete=True,
+                            can_share=True
+                        )
+                        db.session.add(creator_permission)
+                        print(f"✅ Permissions complètes créées pour l'utilisateur {user.username} sur le fichier {file_name}")
+                
                 db.session.commit()
                 
             except Exception as sync_error:
                 print(f"Erreur synchronisation DB: {str(sync_error)}")
+                db.session.rollback()
         
         return jsonify(result)
         
