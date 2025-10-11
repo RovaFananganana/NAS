@@ -2211,3 +2211,141 @@ def sync_nas_database():
             "success": False,
             "error": f"Erreur synchronisation: {str(e)}"
         }), 500
+
+@nas_bp.route('/search', methods=['GET'])
+@jwt_required()
+def search_files():
+    """Recherche récursive de fichiers et dossiers"""
+    try:
+        jwt_identity = get_jwt_identity()
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+        user_id = int(jwt_identity)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
+        
+    user = User.query.get(user_id)
+    if not user:
+        return jsonify({"error": "Utilisateur non trouvé"}), 404
+
+    # Récupérer les paramètres de recherche
+    query = request.args.get('query', '').strip()
+    base_path = normalize_smb_path(request.args.get('path', '/'))
+    recursive = request.args.get('recursive', 'true').lower() == 'true'
+    include_files = request.args.get('include_files', 'true').lower() == 'true'
+    include_folders = request.args.get('include_folders', 'true').lower() == 'true'
+    case_sensitive = request.args.get('case_sensitive', 'false').lower() == 'true'
+    max_results = min(int(request.args.get('max_results', 50)), 200)  # Limite réduite pour plus de rapidité
+    
+    if not query:
+        return jsonify({"error": "Paramètre 'query' requis"}), 400
+    
+    # Vérifier les permissions sur le chemin de base
+    if not check_folder_permission(user, base_path, 'read'):
+        return jsonify({
+            "success": False,
+            "error": f"Permission refusée pour le chemin: {base_path}",
+            "code": "PERMISSION_DENIED"
+        }), 403
+
+    try:
+        smb_client = get_smb_client()
+        results = []
+        visited_paths = set()
+        search_start_time = datetime.now()
+        max_search_time = 2  # Maximum 2 secondes pour plus de réactivité
+        
+        def search_in_directory(current_path, depth=0):
+            """Recherche récursive dans un répertoire (optimisée)"""
+            # Vérifier les limites (résultats, temps) - pas de limite de profondeur
+            if (len(results) >= max_results or 
+                (datetime.now() - search_start_time).total_seconds() > max_search_time):
+                return
+                
+            # Éviter les boucles infinies
+            if current_path in visited_paths:
+                return
+            visited_paths.add(current_path)
+            
+            # Vérifier les permissions pour ce répertoire
+            if not check_folder_permission(user, current_path, 'read'):
+                return
+            
+            try:
+                # Lister les fichiers du répertoire actuel
+                files = smb_client.list_files(current_path)
+                
+                # Séparer fichiers et dossiers pour optimiser
+                directories = []
+                
+                for file_info in files:
+                    if len(results) >= max_results:
+                        break
+                        
+                    # Préparer le terme de recherche
+                    search_term = query if case_sensitive else query.lower()
+                    file_name = file_info['name'] if case_sensitive else file_info['name'].lower()
+                    
+                    # Vérifier si le nom correspond
+                    if search_term in file_name:
+                        # Vérifier les filtres d'inclusion
+                        if (file_info['is_directory'] and include_folders) or \
+                           (not file_info['is_directory'] and include_files):
+                            
+                            # Calculer le chemin relatif
+                            relative_path = file_info['path'].replace(base_path, '').lstrip('/')
+                            
+                            result_item = {
+                                **file_info,
+                                'relative_path': relative_path,
+                                'match_type': 'name'
+                            }
+                            results.append(result_item)
+                    
+                    # Collecter les dossiers pour la recherche récursive
+                    if recursive and file_info['is_directory']:
+                        directories.append(file_info['path'])
+                
+                # Recherche récursive dans les dossiers (après avoir traité tous les fichiers du niveau actuel)
+                for dir_path in directories:
+                    if len(results) >= max_results:
+                        break
+                    search_in_directory(dir_path, depth + 1)
+                        
+            except Exception as e:
+                # Log l'erreur mais continue la recherche dans d'autres dossiers
+                print(f"⚠️ Erreur recherche dans {current_path}: {str(e)}")
+        
+        # Démarrer la recherche
+        search_in_directory(base_path)
+        
+        # Calculer le temps de recherche
+        search_time = (datetime.now() - search_start_time).total_seconds() * 1000
+        
+        # Trier les résultats : dossiers d'abord, puis par nom
+        results.sort(key=lambda x: (not x['is_directory'], x['name'].lower()))
+        
+        return jsonify({
+            "success": True,
+            "results": results,
+            "total_found": len(results),
+            "search_time_ms": round(search_time, 2),
+            "truncated": len(results) >= max_results,
+            "search_params": {
+                "query": query,
+                "base_path": base_path,
+                "recursive": recursive,
+                "include_files": include_files,
+                "include_folders": include_folders,
+                "case_sensitive": case_sensitive,
+                "max_results": max_results
+            }
+        })
+        
+    except Exception as e:
+        print(f"❌ Erreur recherche: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": f"Erreur lors de la recherche: {str(e)}",
+            "code": "SEARCH_ERROR"
+        }), 500
