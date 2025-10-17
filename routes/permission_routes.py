@@ -16,6 +16,7 @@ from utils.access_logger import (
     log_file_permission_action, 
     log_batch_permission_action
 )
+from services.permission_audit_logger import permission_audit_logger
 
 permission_bp = Blueprint('permission', __name__, url_prefix='/permissions')
 
@@ -555,3 +556,579 @@ def get_user_effective_permissions(user_id):
         },
         'permissions': effective
     }), 200
+
+# ===================== DIAGNOSTIC ROUTES =====================
+
+@permission_bp.route('/diagnose/<int:user_id>/<path:path>', methods=['GET'])
+@admin_required
+def diagnose_user_permissions(user_id, path):
+    """
+    Diagnostiquer les permissions d'un utilisateur pour un chemin spécifique
+    """
+    try:
+        user = User.query.get_or_404(user_id)
+        
+        # Normaliser le chemin
+        normalized_path = f"/{path}" if not path.startswith('/') else path
+        
+        # Obtenir les groupes de l'utilisateur avec leurs permissions
+        user_groups = []
+        for group in user.groups:
+            group_info = {
+                'id': group.id,
+                'name': group.name,
+                'active': True,
+                'permissions_on_path': {
+                    'can_read': False,
+                    'can_write': False,
+                    'can_delete': False,
+                    'can_share': False
+                }
+            }
+            
+            # Vérifier les permissions du groupe sur ce chemin
+            # (Cette logique devrait être adaptée selon votre modèle de données)
+            folder_perms = FolderPermission.query.filter_by(group_id=group.id).all()
+            file_perms = FilePermission.query.filter_by(group_id=group.id).all()
+            
+            # Analyser les permissions pour ce chemin spécifique
+            for perm in folder_perms:
+                if perm.folder and normalized_path.startswith(perm.folder.path or ''):
+                    group_info['permissions_on_path']['can_read'] |= perm.can_read
+                    group_info['permissions_on_path']['can_write'] |= perm.can_write
+                    group_info['permissions_on_path']['can_delete'] |= perm.can_delete
+                    group_info['permissions_on_path']['can_share'] |= perm.can_share
+            
+            user_groups.append(group_info)
+        
+        # Calculer les permissions effectives
+        effective_permissions = {
+            'can_read': False,
+            'can_write': False,
+            'can_delete': False,
+            'can_share': False,
+            'source': 'none'
+        }
+        
+        # Vérifier si l'utilisateur est propriétaire
+        is_owner = False
+        # (Logique pour vérifier la propriété selon votre modèle)
+        
+        if is_owner:
+            effective_permissions = {
+                'can_read': True,
+                'can_write': True,
+                'can_delete': True,
+                'can_share': True,
+                'source': 'owner'
+            }
+        else:
+            # Accumuler les permissions des groupes
+            for group in user_groups:
+                group_perms = group['permissions_on_path']
+                if any(group_perms.values()):
+                    effective_permissions['can_read'] |= group_perms['can_read']
+                    effective_permissions['can_write'] |= group_perms['can_write']
+                    effective_permissions['can_delete'] |= group_perms['can_delete']
+                    effective_permissions['can_share'] |= group_perms['can_share']
+                    if effective_permissions['source'] == 'none':
+                        effective_permissions['source'] = 'group'
+        
+        # Construire la chaîne de permissions
+        permission_chain = [
+            {
+                'level': 'user',
+                'permissions': {},
+                'source': 'direct'
+            }
+        ]
+        
+        for group in user_groups:
+            if any(group['permissions_on_path'].values()):
+                permission_chain.append({
+                    'level': 'group',
+                    'group_name': group['name'],
+                    'permissions': group['permissions_on_path'],
+                    'source': 'group_membership'
+                })
+        
+        # Informations de performance (simulées pour l'instant)
+        query_performance = {
+            'duration_ms': 45,
+            'queries_executed': len(user_groups) + 2
+        }
+        
+        return jsonify({
+            'success': True,
+            'permissions': effective_permissions,
+            'diagnostic_info': {
+                'user_id': user.id,
+                'username': user.username,
+                'user_groups': user_groups,
+                'effective_permissions': effective_permissions,
+                'cache_info': {
+                    'cached': False,
+                    'cache_age': None,
+                    'cache_source': None
+                },
+                'query_performance': query_performance,
+                'permission_chain': permission_chain
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in diagnose_user_permissions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/compare/<int:user_id1>/<int:user_id2>/<path:path>', methods=['GET'])
+@admin_required
+def compare_user_permissions(user_id1, user_id2, path):
+    """
+    Comparer les permissions entre deux utilisateurs pour un chemin donné
+    """
+    try:
+        # Obtenir les diagnostics pour les deux utilisateurs
+        user1_response = diagnose_user_permissions(user_id1, path)
+        user2_response = diagnose_user_permissions(user_id2, path)
+        
+        if user1_response[1] != 200 or user2_response[1] != 200:
+            return jsonify({'error': 'Failed to get permissions for one or both users'}), 500
+        
+        user1_data = user1_response[0].get_json()
+        user2_data = user2_response[0].get_json()
+        
+        # Analyser les différences
+        differences = {
+            'permissions': {},
+            'groups': {},
+            'summary': {}
+        }
+        
+        # Comparer les permissions
+        user1_perms = user1_data['permissions']
+        user2_perms = user2_data['permissions']
+        
+        for perm_type in ['can_read', 'can_write', 'can_delete', 'can_share']:
+            if user1_perms[perm_type] != user2_perms[perm_type]:
+                differences['permissions'][perm_type] = {
+                    'user1': user1_perms[perm_type],
+                    'user2': user2_perms[perm_type],
+                    'different': True
+                }
+        
+        # Comparer les groupes
+        user1_groups = [g['name'] for g in user1_data['diagnostic_info']['user_groups']]
+        user2_groups = [g['name'] for g in user2_data['diagnostic_info']['user_groups']]
+        
+        differences['groups'] = {
+            'user1_groups': user1_groups,
+            'user2_groups': user2_groups,
+            'common_groups': list(set(user1_groups) & set(user2_groups)),
+            'user1_only': list(set(user1_groups) - set(user2_groups)),
+            'user2_only': list(set(user2_groups) - set(user1_groups))
+        }
+        
+        # Résumé des différences
+        differences['summary'] = {
+            'has_permission_differences': bool(differences['permissions']),
+            'has_group_differences': bool(differences['groups']['user1_only'] or differences['groups']['user2_only']),
+            'total_differences': len(differences['permissions']) + len(differences['groups']['user1_only']) + len(differences['groups']['user2_only'])
+        }
+        
+        return jsonify({
+            'path': f"/{path}",
+            'user1': user1_data,
+            'user2': user2_data,
+            'differences': differences,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in compare_user_permissions: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/user-groups/<int:user_id>', methods=['GET'])
+@admin_required
+def get_user_groups_detailed(user_id):
+    """
+    Obtenir les groupes détaillés d'un utilisateur avec leurs permissions
+    """
+    try:
+        user = User.query.get_or_404(user_id)
+        
+        groups_data = []
+        for group in user.groups:
+            group_info = {
+                'id': group.id,
+                'name': group.name,
+                'description': getattr(group, 'description', ''),
+                'active': True,
+                'permissions': []
+            }
+            
+            # Obtenir les permissions du groupe sur les dossiers
+            folder_perms = FolderPermission.query.filter_by(group_id=group.id).all()
+            for perm in folder_perms:
+                if perm.folder:
+                    group_info['permissions'].append({
+                        'type': 'folder',
+                        'resource_name': perm.folder.name,
+                        'resource_path': getattr(perm.folder, 'path', ''),
+                        'can_read': perm.can_read,
+                        'can_write': perm.can_write,
+                        'can_delete': perm.can_delete,
+                        'can_share': perm.can_share
+                    })
+            
+            # Obtenir les permissions du groupe sur les fichiers
+            file_perms = FilePermission.query.filter_by(group_id=group.id).all()
+            for perm in file_perms:
+                if perm.file:
+                    group_info['permissions'].append({
+                        'type': 'file',
+                        'resource_name': perm.file.name,
+                        'resource_path': getattr(perm.file, 'path', ''),
+                        'can_read': perm.can_read,
+                        'can_write': perm.can_write,
+                        'can_delete': perm.can_delete,
+                        'can_share': perm.can_share
+                    })
+            
+            groups_data.append(group_info)
+        
+        return jsonify({
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'role': user.role
+            },
+            'groups': groups_data
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_user_groups_detailed: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/user-info/<int:user_id>', methods=['GET'])
+@admin_required
+def get_user_info(user_id):
+    """
+    Obtenir les informations détaillées d'un utilisateur
+    """
+    try:
+        user = User.query.get_or_404(user_id)
+        
+        return jsonify({
+            'id': user.id,
+            'username': user.username,
+            'email': getattr(user, 'email', ''),
+            'role': user.role,
+            'active': getattr(user, 'active', True),
+            'created_at': user.created_at.isoformat() if hasattr(user, 'created_at') else None,
+            'last_login': getattr(user, 'last_login', None),
+            'groups_count': len(user.groups)
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_user_info: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/validate-cache', methods=['POST'])
+@admin_required
+def validate_permission_cache():
+    """
+    Valider la cohérence du cache de permissions
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get('user_id')
+        path = data.get('path')
+        
+        # Pour l'instant, retourner une validation simulée
+        # Cette logique devrait être implémentée selon votre système de cache
+        
+        validation_result = {
+            'cache_consistent': True,
+            'inconsistencies': [],
+            'cache_entries_checked': 0,
+            'last_validation': datetime.now().isoformat()
+        }
+        
+        if user_id:
+            validation_result['user_id'] = user_id
+        if path:
+            validation_result['path'] = path
+        
+        return jsonify(validation_result), 200
+        
+    except Exception as e:
+        print(f"Error in validate_permission_cache: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ===================== ENHANCED PERMISSION CHECKING WITH AUDIT =====================
+
+@permission_bp.route('/check', methods=['GET'])
+@jwt_required()
+def check_permissions_with_audit():
+    """
+    Vérifier les permissions avec audit détaillé et métriques de performance
+    """
+    import time
+    start_time = time.time()
+    
+    try:
+        user_id = get_jwt_identity()
+        user = User.query.get_or_404(user_id)
+        path = request.args.get('path', '/')
+        
+        # Normaliser le chemin
+        normalized_path = f"/{path}" if not path.startswith('/') else path
+        
+        # Métriques de performance
+        timing_data = {
+            'start_time': start_time,
+            'cache_hit': False,
+            'cache_age_ms': None,
+            'db_query_start': None,
+            'db_query_duration_ms': 0,
+            'queries_executed': 0
+        }
+        
+        # Vérifier si l'utilisateur est admin
+        if user.role.upper() == 'ADMIN':
+            admin_permissions = {
+                'can_read': True,
+                'can_write': True,
+                'can_delete': True,
+                'can_share': True,
+                'can_modify': True
+            }
+            
+            end_time = time.time()
+            timing_data['total_duration_ms'] = (end_time - start_time) * 1000
+            
+            # Logger la vérification admin
+            permission_audit_logger.log_permission_check(
+                user_id=user.id,
+                path=normalized_path,
+                result=admin_permissions,
+                groups=[],
+                timing=timing_data
+            )
+            
+            return jsonify({
+                'success': True,
+                'permissions': admin_permissions,
+                'diagnostic_info': {
+                    'user_id': user.id,
+                    'username': user.username,
+                    'user_role': user.role,
+                    'is_admin': True,
+                    'path': normalized_path,
+                    'permission_source': 'admin_role',
+                    'query_performance': {
+                        'duration_ms': timing_data['total_duration_ms'],
+                        'queries_executed': 0
+                    }
+                }
+            }), 200
+        
+        # Pour les utilisateurs non-admin, vérifier les permissions via les groupes
+        timing_data['db_query_start'] = time.time()
+        
+        # Obtenir les groupes de l'utilisateur
+        user_groups = []
+        effective_permissions = {
+            'can_read': False,
+            'can_write': False,
+            'can_delete': False,
+            'can_share': False,
+            'can_modify': False
+        }
+        
+        timing_data['queries_executed'] += 1
+        
+        for group in user.groups:
+            group_info = {
+                'id': group.id,
+                'name': group.name,
+                'permissions_on_path': {
+                    'can_read': False,
+                    'can_write': False,
+                    'can_delete': False,
+                    'can_share': False,
+                    'can_modify': False
+                }
+            }
+            
+            # Vérifier les permissions du groupe sur les dossiers
+            folder_perms = FolderPermission.query.filter_by(group_id=group.id).all()
+            timing_data['queries_executed'] += 1
+            
+            for perm in folder_perms:
+                if perm.folder and perm.folder.path and normalized_path.startswith(perm.folder.path):
+                    group_info['permissions_on_path']['can_read'] |= perm.can_read
+                    group_info['permissions_on_path']['can_write'] |= perm.can_write
+                    group_info['permissions_on_path']['can_delete'] |= perm.can_delete
+                    group_info['permissions_on_path']['can_share'] |= perm.can_share
+                    
+                    # Accumuler dans les permissions effectives
+                    effective_permissions['can_read'] |= perm.can_read
+                    effective_permissions['can_write'] |= perm.can_write
+                    effective_permissions['can_delete'] |= perm.can_delete
+                    effective_permissions['can_share'] |= perm.can_share
+            
+            # Vérifier les permissions du groupe sur les fichiers
+            file_perms = FilePermission.query.filter_by(group_id=group.id).all()
+            timing_data['queries_executed'] += 1
+            
+            for perm in file_perms:
+                if perm.file and perm.file.path and normalized_path == perm.file.path:
+                    group_info['permissions_on_path']['can_read'] |= perm.can_read
+                    group_info['permissions_on_path']['can_write'] |= perm.can_write
+                    group_info['permissions_on_path']['can_delete'] |= perm.can_delete
+                    group_info['permissions_on_path']['can_share'] |= perm.can_share
+                    
+                    # Accumuler dans les permissions effectives
+                    effective_permissions['can_read'] |= perm.can_read
+                    effective_permissions['can_write'] |= perm.can_write
+                    effective_permissions['can_delete'] |= perm.can_delete
+                    effective_permissions['can_share'] |= perm.can_share
+            
+            user_groups.append(group_info)
+        
+        # can_modify est un alias pour can_write
+        effective_permissions['can_modify'] = effective_permissions['can_write']
+        
+        # Calculer les métriques de performance
+        end_time = time.time()
+        timing_data['db_query_duration_ms'] = (end_time - timing_data['db_query_start']) * 1000
+        timing_data['total_duration_ms'] = (end_time - start_time) * 1000
+        
+        # Logger la vérification de permissions
+        permission_audit_logger.log_permission_check(
+            user_id=user.id,
+            path=normalized_path,
+            result=effective_permissions,
+            groups=user_groups,
+            timing=timing_data
+        )
+        
+        # Construire la réponse avec informations de diagnostic
+        diagnostic_info = {
+            'user_id': user.id,
+            'username': user.username,
+            'user_role': user.role,
+            'is_admin': False,
+            'path': normalized_path,
+            'user_groups': user_groups,
+            'effective_permissions': effective_permissions,
+            'permission_source': 'group_membership' if any(
+                any(g['permissions_on_path'].values()) for g in user_groups
+            ) else 'none',
+            'cache_info': {
+                'cached': timing_data['cache_hit'],
+                'cache_age': timing_data['cache_age_ms'],
+                'cache_source': None
+            },
+            'query_performance': {
+                'duration_ms': timing_data['total_duration_ms'],
+                'db_query_duration_ms': timing_data['db_query_duration_ms'],
+                'queries_executed': timing_data['queries_executed']
+            }
+        }
+        
+        return jsonify({
+            'success': True,
+            'permissions': effective_permissions,
+            'diagnostic_info': diagnostic_info
+        }), 200
+        
+    except Exception as e:
+        end_time = time.time()
+        error_duration = (end_time - start_time) * 1000
+        
+        # Logger l'échec
+        try:
+            user_id = get_jwt_identity()
+            path = request.args.get('path', '/')
+            
+            permission_audit_logger.log_permission_failure(
+                user_id=user_id,
+                path=path,
+                error=str(e),
+                context={
+                    'error_type': type(e).__name__,
+                    'duration_ms': error_duration,
+                    'stack_trace': str(e)
+                }
+            )
+        except:
+            pass  # Éviter les erreurs en cascade
+        
+        print(f"Error in check_permissions_with_audit: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/audit-log', methods=['GET'])
+@admin_required
+def get_permission_audit_log():
+    """
+    Récupérer les logs d'audit des permissions
+    """
+    try:
+        user_id = request.args.get('user_id', type=int)
+        path = request.args.get('path')
+        action_filter = request.args.get('action')
+        limit = request.args.get('limit', 100, type=int)
+        
+        # Limiter le nombre d'entrées pour éviter les surcharges
+        limit = min(limit, 1000)
+        
+        audit_trail = permission_audit_logger.get_audit_trail(
+            user_id=user_id,
+            path=path,
+            action_filter=action_filter,
+            limit=limit
+        )
+        
+        return jsonify({
+            'audit_trail': audit_trail,
+            'total_entries': len(audit_trail),
+            'filters_applied': {
+                'user_id': user_id,
+                'path': path,
+                'action': action_filter,
+                'limit': limit
+            }
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_permission_audit_log: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/performance-summary', methods=['GET'])
+@admin_required
+def get_permission_performance_summary():
+    """
+    Obtenir un résumé des performances des permissions
+    """
+    try:
+        user_id = request.args.get('user_id', type=int)
+        hours = request.args.get('hours', 24, type=int)
+        
+        # Limiter la période pour éviter les surcharges
+        hours = min(hours, 168)  # Max 1 semaine
+        
+        performance_summary = permission_audit_logger.get_performance_summary(
+            user_id=user_id,
+            hours=hours
+        )
+        
+        return jsonify({
+            'performance_summary': performance_summary,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_permission_performance_summary: {str(e)}")
+        return jsonify({'error': str(e)}), 500

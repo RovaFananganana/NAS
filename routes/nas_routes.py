@@ -11,6 +11,7 @@ from smb.SMBConnection import SMBConnection
 from dotenv import load_dotenv
 import os
 import io
+import uuid
 
 from models.user import User
 from models.folder import Folder
@@ -417,6 +418,9 @@ def get_smb_client():
 # Instance pour l'optimisation des permissions
 permission_optimizer = PermissionOptimizer()
 
+# Stockage en mémoire pour le suivi des opérations de copie
+_copy_operations = {}
+
 # ================== GESTION DES PERMISSIONS ==================
 
 def check_file_permission(user, file_path, required_action='read'):
@@ -673,15 +677,51 @@ def copy_item():
     try:
         smb_client = get_smb_client()
         
-        # Pour la copie, on doit télécharger puis uploader
-        # Obtenir le nom du fichier
+        # Obtenir les informations sur l'élément source
+        source_info = smb_client.get_file_info(source_path)
         filename = get_filename_from_path(source_path)
         
-        # Télécharger le fichier source
-        file_stream = smb_client.download_file(source_path)
+        # Générer un nom unique si le fichier existe déjà
+        dest_full_path = normalize_smb_path(f"{dest_path.rstrip('/')}/{filename}")
         
-        # Uploader vers la destination
-        result = smb_client.upload_file(file_stream, dest_path, filename, overwrite=False)
+        # Vérifier si la destination existe déjà et générer un nom unique
+        try:
+            existing_files = [f['name'] for f in smb_client.list_files(dest_path)]
+            if filename in existing_files:
+                base_name, ext = os.path.splitext(filename)
+                counter = 1
+                while f"{base_name}_copy_{counter}{ext}" in existing_files:
+                    counter += 1
+                filename = f"{base_name}_copy_{counter}{ext}"
+                dest_full_path = normalize_smb_path(f"{dest_path.rstrip('/')}/{filename}")
+        except:
+            pass  # Si on ne peut pas lister, on continue
+        
+        # Générer un ID unique pour cette opération de copie
+        operation_id = str(uuid.uuid4())
+        
+        # Initialiser le suivi de progression
+        _init_copy_progress(operation_id, source_path, dest_full_path)
+        
+        def progress_callback(event_type, path, current=None, total=None, error=None):
+            _update_copy_progress(operation_id, event_type, path, current, total, error)
+        
+        if source_info['is_directory']:
+            # Copie récursive d'un dossier
+            result = _copy_folder_recursive(smb_client, source_path, dest_full_path, user, progress_callback)
+        else:
+            # Copie d'un fichier simple
+            result = _copy_file_simple(smb_client, source_path, dest_full_path)
+            progress_callback("file_copied", dest_full_path)
+        
+        # Marquer l'opération comme terminée
+        _complete_copy_progress(operation_id, result)
+        
+        # Ajouter l'ID d'opération au résultat
+        result['operation_id'] = operation_id
+        
+        # Log de l'opération
+        log_file_operation(user.id, 'copy', source_path, dest_full_path)
         
         return jsonify(result)
         
@@ -690,6 +730,205 @@ def copy_item():
             "success": False,
             "error": f"Erreur copie: {str(e)}"
         }), 500
+
+def _copy_file_simple(smb_client, source_path, dest_path):
+    """Copie un fichier simple"""
+    try:
+        # Télécharger le fichier source
+        file_stream = smb_client.download_file(source_path)
+        
+        # Obtenir le nom du fichier de destination
+        filename = get_filename_from_path(dest_path)
+        dest_folder = get_parent_path(dest_path)
+        
+        # Uploader vers la destination
+        result = smb_client.upload_file(file_stream, dest_folder, filename, overwrite=False)
+        
+        return {
+            "success": True,
+            "source_path": source_path,
+            "dest_path": dest_path,
+            "message": f"Fichier copié avec succès vers {dest_path}",
+            "type": "file"
+        }
+        
+    except Exception as e:
+        raise Exception(f"Erreur lors de la copie du fichier {source_path}: {str(e)}")
+
+def _copy_folder_recursive(smb_client, source_path, dest_path, user, progress_callback=None):
+    """Copie récursive d'un dossier avec suivi de progression"""
+    try:
+        copied_items = []
+        errors = []
+        
+        # Créer le dossier de destination
+        dest_folder_name = get_filename_from_path(dest_path)
+        dest_parent = get_parent_path(dest_path)
+        
+        try:
+            smb_client.create_folder(dest_parent, dest_folder_name)
+            copied_items.append({"path": dest_path, "type": "folder"})
+            if progress_callback:
+                progress_callback("folder_created", dest_path)
+        except Exception as e:
+            if "already exists" not in str(e).lower():
+                raise Exception(f"Impossible de créer le dossier destination {dest_path}: {str(e)}")
+        
+        # Lister le contenu du dossier source
+        source_items = smb_client.list_files(source_path)
+        total_items = len(source_items)
+        
+        for idx, item in enumerate(source_items):
+            item_source_path = normalize_smb_path(f"{source_path.rstrip('/')}/{item['name']}")
+            item_dest_path = normalize_smb_path(f"{dest_path.rstrip('/')}/{item['name']}")
+            
+            try:
+                # Vérifier les permissions pour chaque élément
+                if not check_folder_permission(user, get_parent_path(item_source_path), 'read'):
+                    errors.append(f"Permission refusée pour {item_source_path}")
+                    continue
+                
+                if progress_callback:
+                    progress_callback("processing", item_source_path, idx + 1, total_items)
+                
+                if item['is_directory']:
+                    # Récursion pour les sous-dossiers
+                    sub_result = _copy_folder_recursive(smb_client, item_source_path, item_dest_path, user, progress_callback)
+                    copied_items.extend(sub_result.get('copied_items', []))
+                    errors.extend(sub_result.get('errors', []))
+                else:
+                    # Copier le fichier
+                    _copy_file_simple(smb_client, item_source_path, item_dest_path)
+                    copied_items.append({"path": item_dest_path, "type": "file"})
+                    if progress_callback:
+                        progress_callback("file_copied", item_dest_path)
+                    
+            except Exception as e:
+                errors.append(f"Erreur copie {item_source_path}: {str(e)}")
+                if progress_callback:
+                    progress_callback("error", item_source_path, str(e))
+        
+        return {
+            "success": len(errors) == 0,
+            "source_path": source_path,
+            "dest_path": dest_path,
+            "message": f"Dossier copié avec succès vers {dest_path}" if len(errors) == 0 else f"Copie terminée avec {len(errors)} erreurs",
+            "type": "folder",
+            "copied_items": copied_items,
+            "errors": errors,
+            "stats": {
+                "total_items": len(copied_items),
+                "errors_count": len(errors)
+            }
+        }
+        
+    except Exception as e:
+        raise Exception(f"Erreur lors de la copie du dossier {source_path}: {str(e)}")
+
+def _init_copy_progress(operation_id, source_path, dest_path):
+    """Initialise le suivi de progression pour une opération de copie"""
+    _copy_operations[operation_id] = {
+        "id": operation_id,
+        "source_path": source_path,
+        "dest_path": dest_path,
+        "status": "started",
+        "start_time": datetime.utcnow().isoformat(),
+        "current_item": None,
+        "progress": 0,
+        "total_items": 0,
+        "completed_items": 0,
+        "errors": [],
+        "events": []
+    }
+
+def _update_copy_progress(operation_id, event_type, path, current=None, total=None, error=None):
+    """Met à jour la progression d'une opération de copie"""
+    if operation_id not in _copy_operations:
+        return
+    
+    operation = _copy_operations[operation_id]
+    
+    # Ajouter l'événement à l'historique
+    event = {
+        "type": event_type,
+        "path": path,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    
+    if current is not None and total is not None:
+        event["current"] = current
+        event["total"] = total
+        operation["progress"] = int((current / total) * 100) if total > 0 else 0
+    
+    if error:
+        event["error"] = error
+        operation["errors"].append({"path": path, "error": error})
+    
+    operation["events"].append(event)
+    operation["current_item"] = path
+    
+    # Mettre à jour les compteurs
+    if event_type in ["file_copied", "folder_created"]:
+        operation["completed_items"] += 1
+    elif event_type == "processing" and total:
+        operation["total_items"] = max(operation["total_items"], total)
+
+def _complete_copy_progress(operation_id, result):
+    """Marque une opération de copie comme terminée"""
+    if operation_id not in _copy_operations:
+        return
+    
+    operation = _copy_operations[operation_id]
+    operation["status"] = "completed" if result.get("success") else "failed"
+    operation["end_time"] = datetime.utcnow().isoformat()
+    operation["result"] = result
+    operation["progress"] = 100 if result.get("success") else operation["progress"]
+
+def _get_copy_progress(operation_id):
+    """Récupère la progression d'une opération de copie"""
+    return _copy_operations.get(operation_id)
+
+def _cleanup_old_operations():
+    """Nettoie les anciennes opérations (plus de 1 heure)"""
+    cutoff_time = datetime.utcnow().timestamp() - 3600  # 1 heure
+    
+    to_remove = []
+    for op_id, operation in _copy_operations.items():
+        try:
+            start_time = datetime.fromisoformat(operation["start_time"]).timestamp()
+            if start_time < cutoff_time:
+                to_remove.append(op_id)
+        except:
+            to_remove.append(op_id)  # Supprimer les opérations malformées
+    
+    for op_id in to_remove:
+        del _copy_operations[op_id]
+
+@nas_bp.route('/copy-progress/<operation_id>', methods=['GET'])
+@jwt_required()
+def get_copy_progress(operation_id):
+    """Obtenir la progression d'une opération de copie"""
+    try:
+        jwt_identity = get_jwt_identity()
+        if jwt_identity is None:
+            return jsonify({"error": "Token JWT invalide - identity manquante"}), 401
+        user_id = int(jwt_identity)
+    except (ValueError, TypeError) as e:
+        return jsonify({"error": f"Token JWT invalide: {str(e)}"}), 401
+        
+    user = User.query.get(user_id)
+    
+    # Nettoyer les anciennes opérations
+    _cleanup_old_operations()
+    
+    progress = _get_copy_progress(operation_id)
+    if not progress:
+        return jsonify({"error": "Opération de copie non trouvée"}), 404
+    
+    return jsonify({
+        "success": True,
+        "progress": progress
+    })
 
 @nas_bp.route('/folder-by-path', methods=['GET'])
 @jwt_required()
@@ -1436,7 +1675,7 @@ def upload_file():
 
 @nas_bp.route('/download/<path:file_path>', methods=['GET', 'OPTIONS'])
 def download_file(file_path):
-    """Téléchargement de fichier avec vérification des permissions"""
+    """Téléchargement de fichier avec vérification des permissions et streaming optimisé"""
     
     # Handle CORS preflight
     if request.method == 'OPTIONS':
@@ -1444,6 +1683,7 @@ def download_file(file_path):
         response.headers.add('Access-Control-Allow-Origin', '*')
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        response.headers.add('Access-Control-Expose-Headers', 'Content-Length,Content-Disposition')
         return response
     
     # Apply JWT only for non-OPTIONS requests
@@ -1479,9 +1719,11 @@ def download_file(file_path):
         try:
             file_info = smb_client.get_file_info(file_path)
             file_size = file_info.get('size', 0) if file_info else 0
-        except:
+        except Exception as e:
+            print(f"⚠️ Could not get file info for {file_path}: {str(e)}")
             file_size = 0
         
+        # Get file stream
         file_stream = smb_client.download_file(file_path)
         filename = get_filename_from_path(file_path)
         mime_type = get_file_mime_type(filename)
@@ -1496,36 +1738,66 @@ def download_file(file_path):
         )
 
         def generate():
-            chunk_size = 8192
-            while True:
-                chunk = file_stream.read(chunk_size)
-                if not chunk:
-                    break
-                yield chunk
-            file_stream.close()
+            """Generator function for streaming large files efficiently"""
+            try:
+                # Use larger chunk size for better performance with large files
+                chunk_size = 64 * 1024  # 64KB chunks for better performance
+                bytes_sent = 0
+                
+                while True:
+                    chunk = file_stream.read(chunk_size)
+                    if not chunk:
+                        break
+                    
+                    bytes_sent += len(chunk)
+                    yield chunk
+                    
+                    # Optional: Log progress for very large files (>100MB)
+                    if file_size > 100 * 1024 * 1024 and bytes_sent % (10 * 1024 * 1024) == 0:
+                        progress = (bytes_sent / file_size) * 100 if file_size > 0 else 0
+                        print(f"📥 Download progress for {filename}: {progress:.1f}% ({bytes_sent}/{file_size} bytes)")
+                        
+            except Exception as e:
+                print(f"❌ Error during file streaming: {str(e)}")
+                raise
+            finally:
+                # Ensure file stream is properly closed
+                try:
+                    if hasattr(file_stream, 'close'):
+                        file_stream.close()
+                except Exception as e:
+                    print(f"⚠️ Error closing file stream: {str(e)}")
 
+        # Prepare response headers
         headers = {
             'Content-Disposition': f'attachment; filename="{filename}"',
-            'Content-Type': mime_type
+            'Content-Type': mime_type,
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
         }
         
         # Add Content-Length header for progress tracking if file size is known
         if file_size > 0:
             headers['Content-Length'] = str(file_size)
 
+        # Create streaming response
         response = Response(
             generate(),
-            headers=headers
+            headers=headers,
+            direct_passthrough=True  # Optimize for streaming
         )
         
-        # Add CORS headers
+        # Add comprehensive CORS headers
         response.headers.add('Access-Control-Allow-Origin', '*')
         response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
         response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        response.headers.add('Access-Control-Expose-Headers', 'Content-Length,Content-Disposition,Content-Type')
         
         return response
         
     except Exception as e:
+        print(f"❌ Download error for {file_path}: {str(e)}")
         return jsonify({
             "success": False,
             "error": f"Erreur téléchargement: {str(e)}"
