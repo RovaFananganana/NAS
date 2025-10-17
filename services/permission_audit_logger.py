@@ -247,6 +247,285 @@ class PermissionAuditLogger:
             performance_data=performance_data
         )
     
+    def log_file_operation(self, user_id: int, operation: str, path: str, 
+                          details: Optional[Dict[str, Any]] = None,
+                          timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations sur les fichiers et dossiers
+        
+        Args:
+            user_id: ID de l'utilisateur
+            operation: Type d'opération (READ, WRITE, DELETE, COPY, MOVE, DOWNLOAD, etc.)
+            path: Chemin du fichier/dossier
+            details: Détails supplémentaires de l'opération
+            timing: Métriques de performance
+        """
+        if not self._should_log('INFO'):
+            return
+            
+        log_details = {
+            'path': path,
+            'operation': operation,
+            'details': details or {},
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        
+        performance_data = timing or {}
+        
+        action = f'FILE_{operation.upper()}'
+        target = f"Path: {path}"
+        
+        self._create_log_entry(
+            user_id=user_id,
+            action=action,
+            target=target,
+            level='INFO',
+            details=log_details,
+            performance_data=performance_data
+        )
+    
+    def log_folder_operation(self, user_id: int, operation: str, path: str,
+                           details: Optional[Dict[str, Any]] = None,
+                           timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations sur les dossiers
+        
+        Args:
+            user_id: ID de l'utilisateur
+            operation: Type d'opération (OPEN, CREATE, DELETE, COPY, MOVE, etc.)
+            path: Chemin du dossier
+            details: Détails supplémentaires de l'opération
+            timing: Métriques de performance
+        """
+        if not self._should_log('INFO'):
+            return
+            
+        log_details = {
+            'path': path,
+            'operation': operation,
+            'details': details or {},
+            'timestamp': datetime.now(timezone.utc).isoformat()
+        }
+        
+        performance_data = timing or {}
+        
+        action = f'FOLDER_{operation.upper()}'
+        target = f"Path: {path}"
+        
+        self._create_log_entry(
+            user_id=user_id,
+            action=action,
+            target=target,
+            level='INFO',
+            details=log_details,
+            performance_data=performance_data
+        )
+    
+    def log_download_operation(self, user_id: int, file_path: str, 
+                             file_size: Optional[int] = None,
+                             timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger spécifiquement les téléchargements de fichiers
+        
+        Args:
+            user_id: ID de l'utilisateur
+            file_path: Chemin du fichier téléchargé
+            file_size: Taille du fichier en bytes
+            timing: Métriques de performance
+        """
+        details = {
+            'file_path': file_path,
+            'file_size_bytes': file_size,
+            'file_size_human': self._format_file_size(file_size) if file_size else None
+        }
+        
+        self.log_file_operation(
+            user_id=user_id,
+            operation='DOWNLOAD',
+            path=file_path,
+            details=details,
+            timing=timing
+        )
+    
+    def log_upload_operation(self, user_id: int, file_path: str, 
+                           file_size: Optional[int] = None,
+                           overwrite: bool = False,
+                           timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger spécifiquement les uploads de fichiers
+        
+        Args:
+            user_id: ID de l'utilisateur
+            file_path: Chemin du fichier uploadé
+            file_size: Taille du fichier en bytes
+            overwrite: Si le fichier a été écrasé
+            timing: Métriques de performance
+        """
+        details = {
+            'file_path': file_path,
+            'file_size_bytes': file_size,
+            'file_size_human': self._format_file_size(file_size) if file_size else None,
+            'overwrite': overwrite
+        }
+        
+        self.log_file_operation(
+            user_id=user_id,
+            operation='UPLOAD',
+            path=file_path,
+            details=details,
+            timing=timing
+        )
+    
+    def log_copy_operation(self, user_id: int, source_path: str, dest_path: str,
+                         is_folder: bool = False,
+                         timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations de copie
+        
+        Args:
+            user_id: ID de l'utilisateur
+            source_path: Chemin source
+            dest_path: Chemin de destination
+            is_folder: True si c'est un dossier
+            timing: Métriques de performance
+        """
+        details = {
+            'source_path': source_path,
+            'destination_path': dest_path,
+            'is_folder': is_folder
+        }
+        
+        if is_folder:
+            self.log_folder_operation(
+                user_id=user_id,
+                operation='COPY',
+                path=source_path,
+                details=details,
+                timing=timing
+            )
+        else:
+            self.log_file_operation(
+                user_id=user_id,
+                operation='COPY',
+                path=source_path,
+                details=details,
+                timing=timing
+            )
+    
+    def log_move_operation(self, user_id: int, source_path: str, dest_path: str,
+                         is_folder: bool = False,
+                         timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations de déplacement
+        
+        Args:
+            user_id: ID de l'utilisateur
+            source_path: Chemin source
+            dest_path: Chemin de destination
+            is_folder: True si c'est un dossier
+            timing: Métriques de performance
+        """
+        details = {
+            'source_path': source_path,
+            'destination_path': dest_path,
+            'is_folder': is_folder
+        }
+        
+        if is_folder:
+            self.log_folder_operation(
+                user_id=user_id,
+                operation='MOVE',
+                path=source_path,
+                details=details,
+                timing=timing
+            )
+        else:
+            self.log_file_operation(
+                user_id=user_id,
+                operation='MOVE',
+                path=source_path,
+                details=details,
+                timing=timing
+            )
+    
+    def log_delete_operation(self, user_id: int, path: str, is_folder: bool = False,
+                           timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations de suppression
+        
+        Args:
+            user_id: ID de l'utilisateur
+            path: Chemin de l'élément supprimé
+            is_folder: True si c'est un dossier
+            timing: Métriques de performance
+        """
+        details = {
+            'path': path,
+            'is_folder': is_folder
+        }
+        
+        if is_folder:
+            self.log_folder_operation(
+                user_id=user_id,
+                operation='DELETE',
+                path=path,
+                details=details,
+                timing=timing
+            )
+        else:
+            self.log_file_operation(
+                user_id=user_id,
+                operation='DELETE',
+                path=path,
+                details=details,
+                timing=timing
+            )
+    
+    def log_read_operation(self, user_id: int, file_path: str,
+                         timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations de lecture de fichiers
+        
+        Args:
+            user_id: ID de l'utilisateur
+            file_path: Chemin du fichier lu
+            timing: Métriques de performance
+        """
+        self.log_file_operation(
+            user_id=user_id,
+            operation='READ',
+            path=file_path,
+            timing=timing
+        )
+    
+    def log_folder_open_operation(self, user_id: int, folder_path: str,
+                                timing: Optional[Dict[str, float]] = None) -> None:
+        """
+        Logger les opérations d'ouverture de dossiers
+        
+        Args:
+            user_id: ID de l'utilisateur
+            folder_path: Chemin du dossier ouvert
+            timing: Métriques de performance
+        """
+        self.log_folder_operation(
+            user_id=user_id,
+            operation='OPEN',
+            path=folder_path,
+            timing=timing
+        )
+    
+    def _format_file_size(self, bytes_size: int) -> str:
+        """Formater la taille de fichier en format lisible"""
+        if not bytes_size:
+            return '0 B'
+        
+        for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            if bytes_size < 1024.0:
+                return f"{bytes_size:.1f} {unit}"
+            bytes_size /= 1024.0
+        return f"{bytes_size:.1f} PB"
+    
     def get_audit_trail(self, user_id: Optional[int] = None, path: Optional[str] = None, 
                        action_filter: Optional[str] = None, limit: int = 100) -> List[Dict]:
         """

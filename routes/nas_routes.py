@@ -30,6 +30,7 @@ from utils.permissions import PermissionSet
 from services.permission_optimizer import PermissionOptimizer
 from services.nas_sync_service import nas_sync_service
 from utils.access_logger import log_file_operation
+from services.permission_audit_logger import permission_audit_logger
 
 load_dotenv()
 
@@ -1408,6 +1409,16 @@ def browse_directory():
             print(f"🔍 Filtrage permissions pour {user.username}: {len(items)} éléments -> {len(accessible_items)} accessibles")
             items = accessible_items
         
+        # Logger l'ouverture du dossier
+        permission_audit_logger.log_folder_open_operation(
+            user_id=user_id,
+            folder_path=path,
+            timing={
+                'items_count': len(items),
+                'filtered_items': len(items) if user.role.upper() != 'ADMIN' else None
+            }
+        )
+        
         return jsonify({
             "success": True,
             "path": path,
@@ -1736,6 +1747,25 @@ def download_file(file_path):
             f"Fichier '{filename}' depuis '{get_parent_path(file_path)}'",
             size_info
         )
+        
+        # Logger l'activité de téléchargement avec détails
+        import time
+        start_time = time.time()
+        
+        def log_download_completion():
+            end_time = time.time()
+            duration_ms = (end_time - start_time) * 1000
+            
+            permission_audit_logger.log_download_operation(
+                user_id=user_id,
+                file_path=file_path,
+                file_size=file_size,
+                timing={
+                    'duration_ms': duration_ms,
+                    'start_time': start_time,
+                    'end_time': end_time
+                }
+            )
 
         def generate():
             """Generator function for streaming large files efficiently"""
@@ -1901,6 +1931,17 @@ def delete_item():
                     raise Exception(f"Impossible de supprimer '{target_path}': {error_msg}")
         
         if result.get('success'):
+            # Logger l'opération de suppression
+            permission_audit_logger.log_delete_operation(
+                user_id=user_id,
+                path=target_path,
+                is_folder=is_directory,
+                timing={
+                    'recursive': recursive or (user.role.upper() == 'ADMIN'),
+                    'file_existed': file_exists
+                }
+            )
+            
             # Synchroniser avec la DB - supprimer l'entrée
             try:
                 file_entry = File.query.filter_by(path=target_path).first()

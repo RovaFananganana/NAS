@@ -493,15 +493,43 @@ def log_activity():
     try:
         data = request.get_json()
         
-        if not data or not data.get('action') or not data.get('target'):
-            return jsonify({"msg": "Action et target requis"}), 400
+        if not data or not data.get('action'):
+            return jsonify({"msg": "Action requise"}), 400
         
         action = data.get('action')
-        target = data.get('target')
+        target = data.get('target', 'unknown')
         details = data.get('details', '')
         
-        # Construire le target avec les détails si fournis
-        log_target = f"{target} - {details}" if details else target
+        # Si target est vide ou None, utiliser 'unknown'
+        if not target or target.strip() == '':
+            target = 'unknown'
+        
+        # Nettoyer et limiter les détails
+        if details:
+            # Si details est un objet JSON, le convertir en string
+            if isinstance(details, dict):
+                details_str = str(details)
+            else:
+                details_str = str(details)
+            
+            # Limiter la taille et nettoyer
+            if len(details_str) > 300:
+                details_str = details_str[:297] + "..."
+            
+            # Construire le target avec les détails si différents
+            if details_str != target and details_str.strip():
+                log_target = f"{target} - {details_str}"
+            else:
+                log_target = target
+        else:
+            log_target = target
+        
+        # Limiter la taille totale du target
+        if len(log_target) > 500:
+            log_target = log_target[:497] + "..."
+        
+        # Nettoyer les caractères problématiques
+        log_target = log_target.replace('\n', ' ').replace('\r', ' ').strip()
         
         # Enregistrer l'activité
         log_user_action(action, log_target)
@@ -510,6 +538,7 @@ def log_activity():
         
     except Exception as e:
         print(f"Erreur lors de l'enregistrement de l'activité: {str(e)}")
+        print(f"Données reçues: {data}")
         return jsonify({"msg": "Erreur lors de l'enregistrement"}), 500
 
 @user_bp.route('/folders/<int:folder_id>/content', methods=['GET'])

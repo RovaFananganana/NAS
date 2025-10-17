@@ -2,7 +2,10 @@ from flask import Blueprint, request, jsonify
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from services.activity_logger import ActivityLogger, ActivityLogError
 from models.user_activity import ActivityType, UserActivity
+from models.access_log import AccessLog
 from models.user import User
+from extensions import db
+from datetime import datetime, timezone
 
 activity_bp = Blueprint('activity', __name__)
 activity_logger = ActivityLogger()
@@ -175,6 +178,117 @@ def get_activity_types():
     except Exception as e:
         return jsonify({
             'error': 'Internal server error',
+            'message': str(e)
+        }), 500
+
+@activity_bp.route('/activity-log', methods=['POST', 'OPTIONS'])
+def log_frontend_activity():
+    """
+    Log activity from frontend (compatible with useActivityLogger)
+    
+    Request body:
+    {
+        "operation": "string",
+        "context": "object",
+        "timestamp": "string (ISO format)"
+    }
+    """
+    # Handle preflight OPTIONS request
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
+    # Require JWT for POST requests
+    from flask_jwt_extended import verify_jwt_in_request
+    verify_jwt_in_request()
+    
+    try:
+        current_user_id = get_jwt_identity()
+        data = request.get_json()
+        
+        if not data or 'operation' not in data:
+            return jsonify({'error': 'Operation is required'}), 400
+        
+        operation = data['operation']
+        context = data.get('context', {})
+        
+        # Map frontend operations to backend activity types
+        operation_mapping = {
+            'FOLDER_OPEN': 'navigation',
+            'FILE_READ': 'navigation',
+            'FILE_DOWNLOAD': 'file_download',
+            'FILE_UPLOAD': 'file_upload',
+            'FILE_DELETE': 'file_delete',
+            'FOLDER_DELETE': 'folder_delete',
+            'FILE_COPY': 'file_copy',
+            'FOLDER_COPY': 'file_copy',
+            'FILE_MOVE': 'file_move',
+            'FOLDER_MOVE': 'file_move',
+            'FILE_RENAME': 'file_rename',
+            'FOLDER_RENAME': 'file_rename',
+            'FILE_CREATE': 'folder_create',
+            'FOLDER_CREATE': 'folder_create'
+        }
+        
+        action = operation_mapping.get(operation, 'other')
+        
+        # Extract resource path
+        resource = context.get('path') or context.get('source_path') or 'unknown'
+        
+        # Prepare details
+        details = {
+            'operation': operation,
+            'frontend_context': context
+        }
+        
+        # Add timing information if available
+        if 'timing' in context:
+            details['timing'] = context['timing']
+        
+        # Add file information if available
+        if 'file_info' in context:
+            details['file_info'] = context['file_info']
+        
+        # Map frontend operations to AccessLog actions
+        access_log_mapping = {
+            'FOLDER_OPEN': 'ACCESS_FOLDER',
+            'FILE_READ': 'ACCESS_FILE',
+            'FILE_DOWNLOAD': 'DOWNLOAD_FILE',
+            'FILE_UPLOAD': 'CREATE_FILE',
+            'FILE_DELETE': 'DELETE_FILE',
+            'FOLDER_DELETE': 'DELETE_FOLDER',
+            'FILE_COPY': 'CREATE_FILE',
+            'FOLDER_COPY': 'CREATE_FOLDER',
+            'FILE_MOVE': 'MOVE_FILE',
+            'FOLDER_MOVE': 'MOVE_FOLDER',
+            'FILE_RENAME': 'RENAME_FILE',
+            'FOLDER_RENAME': 'RENAME_FOLDER',
+            'FILE_CREATE': 'CREATE_FILE',
+            'FOLDER_CREATE': 'CREATE_FOLDER'
+        }
+        
+        access_action = access_log_mapping.get(operation, operation)
+        
+        # Create AccessLog entry
+        access_log = AccessLog(
+            user_id=current_user_id,
+            action=access_action,
+            target=resource,
+            timestamp=datetime.now(timezone.utc)
+        )
+        
+        db.session.add(access_log)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Activity logged successfully',
+            'log_id': access_log.id
+        }), 200
+        
+    except Exception as e:
+        print(f"Error logging frontend activity: {str(e)}")
+        return jsonify({
+            'error': 'Failed to log activity',
             'message': str(e)
         }), 500
 
