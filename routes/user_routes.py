@@ -328,15 +328,23 @@ def get_storage_info():
 @user_bp.route('/my-logs', methods=['GET'])
 @jwt_required()
 def get_my_logs():
-    """Récupère les logs d'activité de l'utilisateur connecté"""
+    """Récupère les logs d'activité de l'utilisateur connecté avec filtres"""
     user_id = get_jwt_identity()
     
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 20, type=int)
+    action_filter = request.args.get('action')
     
-    logs = AccessLog.query.filter_by(user_id=user_id).order_by(
-        AccessLog.timestamp.desc()
-    ).paginate(page=page, per_page=per_page, error_out=False)
+    # Build query with filters
+    query = AccessLog.query.filter_by(user_id=user_id)
+    
+    # Apply action filter if provided
+    if action_filter:
+        query = query.filter(AccessLog.action == action_filter)
+    
+    logs = query.order_by(AccessLog.timestamp.desc()).paginate(
+        page=page, per_page=per_page, error_out=False
+    )
     
     logs_data = []
     for log in logs.items:
