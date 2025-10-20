@@ -365,7 +365,7 @@ class NasSyncService:
                 'nas_accessible': False
             }
         
-        print("✅ NAS connection successful")
+        print("✅ connexion NAS réussie")
         
         # Scan NAS structure
         print("📂 Scanning NAS structure...")

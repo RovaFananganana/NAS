@@ -509,7 +509,7 @@ def get_nas_status():
                     'connected': True,
                     'server_info': test_result.get('server_info', {}),
                     'root_files_count': test_result.get('root_files_count', 0),
-                    'message': 'NAS connection successful'
+                    'message': 'connexion NAS réussie'
                 }), 200
             else:
                 return jsonify({

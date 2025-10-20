@@ -1132,3 +1132,147 @@ def get_permission_performance_summary():
     except Exception as e:
         print(f"Error in get_permission_performance_summary: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+# ===================== ROUTES PAR CHEMIN =====================
+
+@permission_bp.route('/files/<path:file_path>', methods=['GET', 'OPTIONS'])
+def get_file_permissions_by_path(file_path):
+    """Récupérer les permissions d'un fichier par son chemin"""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
+    # Apply admin_required only for non-OPTIONS requests
+    from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
+    try:
+        verify_jwt_in_request()
+        admin_user_id = get_jwt_identity()
+        user = User.query.get(admin_user_id)
+        
+        if not user or user.role.upper() != 'ADMIN':
+            return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
+            
+    except Exception as e:
+        print(f"JWT verification error: {str(e)}")
+        return jsonify({"msg": "Token d'authentification requis"}), 401
+    
+    try:
+        # Décoder le chemin
+        import urllib.parse
+        decoded_path = urllib.parse.unquote(file_path)
+        if not decoded_path.startswith('/'):
+            decoded_path = '/' + decoded_path
+        
+        # Trouver le fichier par son chemin
+        file = File.query.filter_by(path=decoded_path).first()
+        if not file:
+            return jsonify({"msg": f"Fichier non trouvé: {decoded_path}"}), 404
+        
+        # Récupérer les permissions
+        permissions = FilePermission.query.filter_by(file_id=file.id).all()
+        
+        user_permissions = []
+        group_permissions = []
+        
+        for perm in permissions:
+            perm_data = {
+                'id': perm.id,
+                'can_read': perm.can_read,
+                'can_write': perm.can_write,
+                'can_delete': perm.can_delete,
+                'can_share': perm.can_share,
+            }
+            
+            if perm.user_id:
+                perm_data['user_id'] = perm.user_id
+                perm_data['username'] = perm.user.username if perm.user else f'User {perm.user_id}'
+                user_permissions.append(perm_data)
+            elif perm.group_id:
+                perm_data['group_id'] = perm.group_id
+                perm_data['group_name'] = perm.group.name if perm.group else f'Group {perm.group_id}'
+                group_permissions.append(perm_data)
+        
+        return jsonify({
+            'file': {
+                'id': file.id,
+                'name': file.name,
+                'path': file.path,
+                'owner': file.owner.username if file.owner else 'Unknown'
+            },
+            'user_permissions': user_permissions,
+            'group_permissions': group_permissions
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_file_permissions_by_path: {str(e)}")
+        return jsonify({"msg": f"Erreur: {str(e)}"}), 500
+
+@permission_bp.route('/folders/<path:folder_path>', methods=['GET', 'OPTIONS'])
+def get_folder_permissions_by_path(folder_path):
+    """Récupérer les permissions d'un dossier par son chemin"""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    
+    # Apply admin_required only for non-OPTIONS requests
+    from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity
+    try:
+        verify_jwt_in_request()
+        admin_user_id = get_jwt_identity()
+        user = User.query.get(admin_user_id)
+        
+        if not user or user.role.upper() != 'ADMIN':
+            return jsonify({"msg": "Accès réservé aux administrateurs"}), 403
+            
+    except Exception as e:
+        print(f"JWT verification error: {str(e)}")
+        return jsonify({"msg": "Token d'authentification requis"}), 401
+    
+    try:
+        # Décoder le chemin
+        import urllib.parse
+        decoded_path = urllib.parse.unquote(folder_path)
+        if not decoded_path.startswith('/'):
+            decoded_path = '/' + decoded_path
+        
+        # Trouver le dossier par son chemin
+        folder = Folder.query.filter_by(path=decoded_path).first()
+        if not folder:
+            return jsonify({"msg": f"Dossier non trouvé: {decoded_path}"}), 404
+        
+        # Récupérer les permissions
+        permissions = FolderPermission.query.filter_by(folder_id=folder.id).all()
+        
+        user_permissions = []
+        group_permissions = []
+        
+        for perm in permissions:
+            perm_data = {
+                'id': perm.id,
+                'can_read': perm.can_read,
+                'can_write': perm.can_write,
+                'can_delete': perm.can_delete,
+                'can_share': perm.can_share,
+            }
+            
+            if perm.user_id:
+                perm_data['user_id'] = perm.user_id
+                perm_data['username'] = perm.user.username if perm.user else f'User {perm.user_id}'
+                user_permissions.append(perm_data)
+            elif perm.group_id:
+                perm_data['group_id'] = perm.group_id
+                perm_data['group_name'] = perm.group.name if perm.group else f'Group {perm.group_id}'
+                group_permissions.append(perm_data)
+        
+        return jsonify({
+            'folder': {
+                'id': folder.id,
+                'name': folder.name,
+                'path': folder.path,
+                'owner': folder.owner.username if folder.owner else 'Unknown'
+            },
+            'user_permissions': user_permissions,
+            'group_permissions': group_permissions
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in get_folder_permissions_by_path: {str(e)}")
+        return jsonify({"msg": f"Erreur: {str(e)}"}), 500

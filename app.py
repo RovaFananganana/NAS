@@ -16,6 +16,9 @@ def create_app():
 
     # ✅ Configuration JWT claire
     app.config["JWT_ERROR_MESSAGE_KEY"] = "msg"
+    
+    # ✅ Configuration pour gros fichiers
+    app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024 * 1024  # 5GB limit
 
     # Enable CORS for development - very permissive for debugging
     CORS(app, 
