@@ -45,12 +45,23 @@ class PermissionAuditLogger:
             }
             
             # Créer l'entrée de log
+            # Note: AccessLog doesn't have a details field, so we include minimal details in target
+            # Keep only essential info to avoid field size limit
+            essential_details = {
+                'level': level,
+                'action': details.get('action', '') if details else ''
+            }
+            target_with_details = f"{target} | {json.dumps(essential_details)}"
+            
+            # Ensure we don't exceed field limit
+            if len(target_with_details) > 250:
+                target_with_details = target[:245] + "..."
+            
             log_entry = AccessLog(
                 user_id=user_id,
                 action=action,
-                target=target,
-                timestamp=datetime.now(timezone.utc),
-                details=json.dumps(log_details, default=str)
+                target=target_with_details,
+                timestamp=datetime.now(timezone.utc)
             )
             
             db.session.add(log_entry)

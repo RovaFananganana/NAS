@@ -11,6 +11,8 @@ from .performance import performance_bp
 from .nas_routes import nas_bp
 from .favorites_routes import favorites_bp
 from .activity_routes import activity_bp
+from .file_type_config_routes import file_type_config_bp
+from .cache_routes import cache_bp
 
 def register_blueprints(app):
     app.register_blueprint(auth_bp, url_prefix="/auth")
@@ -24,3 +26,5 @@ def register_blueprints(app):
     app.register_blueprint(nas_bp, url_prefix="/nas")
     app.register_blueprint(favorites_bp, url_prefix="/favorites")
     app.register_blueprint(activity_bp, url_prefix="/api")
+    app.register_blueprint(file_type_config_bp)
+    app.register_blueprint(cache_bp)

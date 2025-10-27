@@ -10,6 +10,7 @@ from .file_permission import FilePermission
 from .folder_permission import FolderPermission
 from .permission_cache import PermissionCache
 from .favorite import Favorite
+from .file_type_config import FileTypeConfig
 
 __all__ = [
     "User",
@@ -23,4 +24,5 @@ __all__ = [
     "FilePermission",
     "FolderPermission",
     "PermissionCache",
-    "Favorite",]
+    "Favorite",
+    "FileTypeConfig",]

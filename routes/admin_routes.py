@@ -51,6 +51,23 @@ def log_admin_action(action, target):
     except Exception as e:
         print("Erreur log_admin_action:", e)
 
+# ------------------------ ADMIN INDEX ------------------------
+
+@admin_bp.route('/', methods=['GET'])
+@admin_required
+def admin_index():
+    """Admin dashboard index"""
+    return jsonify({
+        "message": "Admin API is working",
+        "endpoints": [
+            "/admin/users",
+            "/admin/groups", 
+            "/admin/permissions",
+            "/admin/logs",
+            "/admin/stats"
+        ]
+    })
+
 # ------------------------ UTILISATEURS ------------------------
 
 @admin_bp.route('/users', methods=['GET'])
