@@ -1,4 +1,4 @@
-from flask import Flask, request
+from flask import Flask, request, make_response
 from flask_jwt_extended import JWTManager
 from extensions import db, migrate
 from config import Config
@@ -26,6 +26,21 @@ def create_app():
          allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
          methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
          supports_credentials=True)
+
+    @app.before_request
+    def handle_preflight():
+        # Autoriser toutes les requêtes OPTIONS (prévol CORS)
+        if request.method == "OPTIONS":
+            response = make_response()
+            origin = request.headers.get('Origin')
+            allowed_origins = ["http://localhost:5173", "http://localhost:5174", "http://127.0.0.1:5173", "http://127.0.0.1:5174", "http://localhost:3000", "null"]
+            
+            if origin in allowed_origins or origin is None:
+                response.headers["Access-Control-Allow-Origin"] = origin or "*"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Requested-With"
+            response.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            return response
 
     @app.after_request
     def after_request(response):

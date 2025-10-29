@@ -144,7 +144,7 @@ class GlobalSMBClient:
             
             for file_obj in files:
                 if file_obj.filename not in [".", ".."]:
-                    file_info = format_smb_file_info(file_obj, path)
+                    file_info = format_smb_file_info(file_obj, path, self.conn)
                     result.append(file_info)
             
             # Trier: dossiers d'abord, puis par nom
@@ -163,7 +163,7 @@ class GlobalSMBClient:
                 result = []
                 for file_obj in files:
                     if file_obj.filename not in [".", ".."]:
-                        file_info = format_smb_file_info(file_obj, path)
+                        file_info = format_smb_file_info(file_obj, path, self.conn)
                         result.append(file_info)
                 result.sort(key=lambda x: (not x['is_directory'], x['name'].lower()))
                 print(f"✅ Reconnexion réussie, {len(result)} éléments trouvés")

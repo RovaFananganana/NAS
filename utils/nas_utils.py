@@ -29,7 +29,7 @@ def is_safe_path(path: str, base: str = "/") -> bool:
 
 def normalize_smb_path(path: str) -> str:
     """
-    Normalise un chemin pour SMB (remplace \ par /, supprime doubles /)
+    Normalise un chemin pour SMB (remplace \\ par /, supprime doubles /)
     """
     if not path:
         return "/"
@@ -282,3 +282,68 @@ def format_smb_file_info(file_obj, path: str = "") -> dict:
         'mime_type': get_file_mime_type(file_obj.filename) if not file_obj.isDirectory else None,
         'category': get_file_category(file_obj.filename) if not file_obj.isDirectory else 'folder'
     }
+
+# ================= FORMATAGE SMB ==================
+
+def format_smb_file_info(file_obj, base_path="/", smb_conn=None):
+    """
+    Formate les informations d'un fichier SMB pour l'API
+    """
+    from datetime import datetime
+    
+    # Informations de base
+    file_info = {
+        'name': file_obj.filename,
+        'path': normalize_smb_path(f"{base_path.rstrip('/')}/{file_obj.filename}"),
+        'is_directory': file_obj.isDirectory,
+        'size': file_obj.file_size if not file_obj.isDirectory else 0,
+        'created': datetime.fromtimestamp(file_obj.create_time).isoformat() if file_obj.create_time else None,
+        'modified': datetime.fromtimestamp(file_obj.last_write_time).isoformat() if file_obj.last_write_time else None,
+        'extension': get_file_extension(file_obj.filename) if not file_obj.isDirectory else None,
+        'mime_type': get_file_mime_type(file_obj.filename) if not file_obj.isDirectory else None,
+        'category': get_file_category(file_obj.filename) if not file_obj.isDirectory else 'folder'
+    }
+    
+    # Calcul de la taille des dossiers si connexion SMB disponible
+    if file_obj.isDirectory and smb_conn:
+        try:
+            folder_size = calculate_folder_size(smb_conn, file_info['path'])
+            file_info['size'] = folder_size
+        except Exception as e:
+            print(f"Erreur calcul taille dossier {file_info['path']}: {e}")
+            file_info['size'] = 0
+    
+    return file_info
+
+def calculate_folder_size(smb_conn, folder_path, shared_folder='NAS'):
+    """
+    Calcule récursivement la taille d'un dossier
+    """
+    total_size = 0
+    
+    try:
+        # Lister le contenu du dossier
+        files = smb_conn.listPath(shared_folder, folder_path)
+        
+        for file_obj in files:
+            if file_obj.filename in [".", ".."]:
+                continue
+                
+            if file_obj.isDirectory:
+                # Récursion pour les sous-dossiers
+                subfolder_path = normalize_smb_path(f"{folder_path}/{file_obj.filename}")
+                total_size += calculate_folder_size(smb_conn, subfolder_path, shared_folder)
+            else:
+                # Ajouter la taille du fichier
+                total_size += file_obj.file_size
+                
+    except Exception as e:
+        print(f"Erreur lors du calcul de taille pour {folder_path}: {e}")
+        
+    return total_size
+
+def get_file_extension(filename):
+    """
+    Retourne l'extension d'un fichier
+    """
+    return Path(filename).suffix.lower().lstrip('.') if filename else None

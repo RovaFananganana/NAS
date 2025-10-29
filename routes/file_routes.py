@@ -28,7 +28,7 @@ def upload_file():
     # ici tu peux utiliser request.files['file'] pour gérer l’upload
     return jsonify({"msg": "Upload placeholder"})
 
-@file_bp.route('/<path:file_path>/content', methods=['GET'])
+@file_bp.route('/<path:file_path>/content', methods=['GET', 'OPTIONS'])
 @jwt_required(optional=True)
 def get_file_content(file_path):
     """
@@ -36,6 +36,10 @@ def get_file_content(file_path):
     Returns raw content or converted content based on file type
     """
     try:
+        # Handle OPTIONS requests
+        if request.method == "OPTIONS":
+            return '', 200
+            
         # Handle authentication - either from header or query parameter
         from flask_jwt_extended import get_jwt_identity, verify_jwt_in_request, decode_token
         
@@ -229,15 +233,34 @@ def get_raw_file(file_path):
         if not file_path or '..' in file_path:
             return jsonify({"error": "Invalid file path"}), 400
         
-        full_path = os.path.join('uploads', file_path)
+        # Get NAS storage root from environment
+        storage_root = os.getenv('STORAGE_ROOT', '//10.61.17.33/NAS')
         
-        if not os.path.exists(full_path):
-            return jsonify({"error": "File not found"}), 404
-        
-        if not os.path.isfile(full_path):
-            return jsonify({"error": "Path is not a file"}), 400
-        
-        return send_file(full_path)
+        # For SMB storage, we can't serve files directly
+        if storage_root.startswith('//'):
+            # Return SMB path information instead of trying to serve the file
+            nas_server = os.getenv('NAS_SERVER', '10.61.17.33')
+            nas_share = os.getenv('NAS_SHARE', 'NAS')
+            clean_path = file_path.lstrip('/')
+            smb_path = f"smb://{nas_server}/{nas_share}/{clean_path}"
+            
+            return jsonify({
+                "error": "Direct file access not supported for SMB storage",
+                "smb_path": smb_path,
+                "download_url": f"/files/download?path={urllib.parse.quote(file_path)}",
+                "message": "Use SMB path or download URL to access file"
+            }), 501
+        else:
+            # Local storage
+            full_path = os.path.join(storage_root, file_path.lstrip('/'))
+            
+            if not os.path.exists(full_path):
+                return jsonify({"error": "File not found"}), 404
+            
+            if not os.path.isfile(full_path):
+                return jsonify({"error": "Path is not a file"}), 400
+            
+            return send_file(full_path)
         
     except Exception as e:
         logger.error(f"Error serving raw file {file_path}: {str(e)}")
