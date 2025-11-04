@@ -422,43 +422,97 @@ def get_statistics():
                 stats['sync_stats'] = sync_result['stats']
             else:
                 # Fallback to database stats if sync fails
-                stats = {
-                    'total_users': User.query.count(),
-                    'total_groups': Group.query.count(),
-                    'total_folders': Folder.query.count(),
-                    'total_files': File.query.count(),
-                    'admin_users': User.query.filter_by(role='ADMIN').count(),
-                    'simple_users': User.query.filter_by(role='SIMPLE_USER').count(),
-                    'sync_performed': False,
-                    'sync_error': sync_result.get('message', 'Sync failed')
-                }
+                stats = _get_filtered_stats()
+                stats['sync_performed'] = False
+                stats['sync_error'] = sync_result.get('message', 'Sync failed')
         else:
-            # Regular database statistics
-            stats = {
-                'total_users': User.query.count(),
-                'total_groups': Group.query.count(),
-                'total_folders': Folder.query.count(),
-                'total_files': File.query.count(),
-                'admin_users': User.query.filter_by(role='ADMIN').count(),
-                'simple_users': User.query.filter_by(role='SIMPLE_USER').count(),
-                'sync_performed': False
-            }
+            # Regular database statistics with filtering
+            stats = _get_filtered_stats()
+            stats['sync_performed'] = False
         
         return jsonify(stats), 200
         
     except Exception as e:
         # Fallback to basic stats if anything fails
-        stats = {
-            'total_users': User.query.count(),
-            'total_groups': Group.query.count(),
-            'total_folders': Folder.query.count(),
-            'total_files': File.query.count(),
-            'admin_users': User.query.filter_by(role='ADMIN').count(),
-            'simple_users': User.query.filter_by(role='SIMPLE_USER').count(),
-            'sync_performed': False,
-            'error': str(e)
-        }
+        stats = _get_filtered_stats()
+        stats['sync_performed'] = False
+        stats['error'] = str(e)
         return jsonify(stats), 200
+
+def _get_filtered_stats():
+    """Get statistics excluding #recycle and #recycler folders"""
+    # Exclure les dossiers #recycle et #recycler
+    excluded_folders = ['#recycle', '#recycler']
+    
+    # Compter les dossiers en excluant #recycle et #recycler
+    total_folders = Folder.query.filter(
+        ~Folder.name.in_(excluded_folders)
+    ).count()
+    
+    # Obtenir les IDs des dossiers à exclure (y compris leurs sous-dossiers)
+    excluded_folder_ids = []
+    for folder_name in excluded_folders:
+        excluded_root = Folder.query.filter_by(name=folder_name).all()
+        for root in excluded_root:
+            excluded_folder_ids.append(root.id)
+            # Ajouter tous les sous-dossiers récursivement
+            excluded_folder_ids.extend(_get_all_subfolder_ids(root.id))
+    
+    # Compter les fichiers en excluant ceux dans #recycle et #recycler
+    # et les fichiers supprimés (is_deleted=True)
+    total_files_query = File.query
+    
+    # Exclure les fichiers dans les dossiers exclus
+    if excluded_folder_ids:
+        total_files_query = total_files_query.filter(
+            ~File.folder_id.in_(excluded_folder_ids)
+        )
+    
+    # Exclure les fichiers supprimés si le champ existe
+    if hasattr(File, 'is_deleted'):
+        total_files_query = total_files_query.filter(
+            (File.is_deleted == False) | (File.is_deleted == None)
+        )
+    
+    total_files = total_files_query.count()
+    
+    # Calculer la taille totale utilisée en excluant les dossiers #recycle et #recycler
+    total_size_kb = 0
+    size_query = db.session.query(db.func.sum(File.size_kb))
+    
+    if excluded_folder_ids:
+        size_query = size_query.filter(~File.folder_id.in_(excluded_folder_ids))
+    
+    if hasattr(File, 'is_deleted'):
+        size_query = size_query.filter(
+            (File.is_deleted == False) | (File.is_deleted == None)
+        )
+    
+    result = size_query.scalar()
+    total_size_kb = result if result else 0
+    
+    return {
+        'total_users': User.query.count(),
+        'total_groups': Group.query.count(),
+        'total_folders': total_folders,
+        'total_files': total_files,
+        'total_size_kb': total_size_kb,
+        'total_size_bytes': total_size_kb * 1024,
+        'admin_users': User.query.filter_by(role='ADMIN').count(),
+        'simple_users': User.query.filter_by(role='SIMPLE_USER').count()
+    }
+
+def _get_all_subfolder_ids(parent_id):
+    """Récupérer récursivement tous les IDs des sous-dossiers"""
+    subfolder_ids = []
+    subfolders = Folder.query.filter_by(parent_id=parent_id).all()
+    
+    for subfolder in subfolders:
+        subfolder_ids.append(subfolder.id)
+        # Récursion pour les sous-dossiers
+        subfolder_ids.extend(_get_all_subfolder_ids(subfolder.id))
+    
+    return subfolder_ids
 
 @admin_bp.route('/sync-nas', methods=['POST'])
 @admin_required
