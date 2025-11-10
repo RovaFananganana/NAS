@@ -1833,6 +1833,167 @@ def download_file(file_path):
             "error": f"Erreur téléchargement: {str(e)}"
         }), 500
 
+@nas_bp.route('/stream', methods=['GET', 'OPTIONS'])
+def stream_file():
+    """Streaming de fichier (inline) avec support de l'en-tête Range pour media/PDF/Images"""
+    # CORS preflight
+    if request.method == 'OPTIONS':
+        response = Response()
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Range')
+        response.headers.add('Access-Control-Allow-Methods', 'GET,OPTIONS')
+        response.headers.add('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,ETag,Last-Modified')
+        return response
+
+    # Auth
+    from flask_jwt_extended import verify_jwt_in_request, get_jwt_identity, decode_token
+    try:
+        user_id = None
+        # Support token via query param for media tags
+        query_token = request.args.get('token')
+        if query_token:
+            try:
+                decoded = decode_token(query_token)
+                identity = decoded.get('sub') or decoded.get('identity')
+                if identity is not None:
+                    user_id = int(identity)
+            except Exception as e:
+                print(f"⚠️ stream_file: invalid query token: {e}")
+        if user_id is None:
+            # Fallback to Authorization header
+            verify_jwt_in_request()
+            user_id = int(get_jwt_identity())
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "Utilisateur non trouvé"}), 401
+    except Exception as e:
+        return jsonify({"error": "Token d'authentification requis"}), 401
+
+    # Chemin
+    raw_path = request.args.get('path', '')
+    if not raw_path:
+        return jsonify({"error": "Paramètre path requis"}), 400
+    try:
+        decoded = urllib.parse.unquote(raw_path)
+    except Exception:
+        decoded = raw_path
+    smb_path = normalize_smb_path(decoded)
+    if not validate_smb_path(smb_path):
+        return jsonify({"error": "Chemin de fichier invalide"}), 400
+
+    # Permission lecture sur le dossier parent
+    if not check_folder_permission(user, get_parent_path(smb_path), 'read'):
+        return jsonify({"error": "Permission de lecture refusée"}), 403
+
+    try:
+        smb_client = get_smb_client()
+        # Info fichier
+        try:
+            info = smb_client.get_file_info(smb_path) or {}
+            file_size = int(info.get('size') or 0)
+            last_modified = info.get('last_modified') or None
+        except Exception as e:
+            print(f"⚠️ stream_file: get_file_info failed: {e}")
+            file_size = 0
+            last_modified = None
+
+        filename = get_filename_from_path(smb_path)
+        mime_type = get_file_mime_type(filename)
+
+        # ETag simple (taille + nom)
+        etag = f'W/"{file_size}-{hash(filename)}"'
+
+        # Gestion Range
+        range_header = request.headers.get('Range', None)
+        start = 0
+        end = file_size - 1 if file_size > 0 else None
+        status_code = 200
+
+        if range_header and file_size > 0:
+            # Format: bytes=start-end
+            try:
+                units, rng = range_header.split("=")
+                if units.strip().lower() == "bytes":
+                    start_str, end_str = rng.split("-")
+                    if start_str.strip():
+                        start = int(start_str)
+                    if end_str.strip():
+                        end = int(end_str)
+                    if end is None or end >= file_size:
+                        end = file_size - 1
+                    if start < 0 or start > end or end >= file_size:
+                        return Response(status=416)
+                    status_code = 206
+            except Exception as e:
+                print(f"⚠️ stream_file: invalid Range header '{range_header}': {e}")
+
+        # Ouvrir le flux SMB
+        stream = smb_client.download_file(smb_path)
+
+        # Si Range, avancer jusqu'au start (fallback sans seek)
+        bytes_to_skip = start
+        if status_code == 206 and bytes_to_skip > 0:
+            skip_chunk = 64 * 1024
+            skipped = 0
+            while skipped < bytes_to_skip:
+                to_read = min(skip_chunk, bytes_to_skip - skipped)
+                chunk = stream.read(to_read)
+                if not chunk:
+                    break
+                skipped += len(chunk)
+
+        bytes_left = (end - start + 1) if (end is not None and file_size > 0) else None
+
+        def generate():
+            try:
+                chunk_size = 64 * 1024
+                sent = 0
+                while True:
+                    if bytes_left is not None:
+                        to_read = min(chunk_size, bytes_left - sent)
+                        if to_read <= 0:
+                            break
+                    else:
+                        to_read = chunk_size
+                    chunk = stream.read(to_read)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    yield chunk
+            finally:
+                try:
+                    if hasattr(stream, 'close'):
+                        stream.close()
+                except Exception as e:
+                    print(f"⚠️ stream_file: error closing stream: {e}")
+
+        headers = {
+            'Content-Type': mime_type,
+            'Content-Disposition': f'inline; filename="{filename}"',
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'private, max-age=3600',
+            'ETag': etag
+        }
+        if last_modified:
+            headers['Last-Modified'] = last_modified
+
+        if file_size > 0:
+            if status_code == 206:
+                headers['Content-Range'] = f'bytes {start}-{end}/{file_size}'
+                headers['Content-Length'] = str(end - start + 1)
+            else:
+                headers['Content-Length'] = str(file_size)
+
+        response = Response(generate(), status=status_code, headers=headers, direct_passthrough=True)
+        # CORS
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,ETag,Last-Modified')
+        return response
+
+    except Exception as e:
+        print(f"❌ stream_file error for {smb_path}: {str(e)}")
+        return jsonify({"error": f"Erreur de streaming: {str(e)}"}), 500
+
 @nas_bp.route('/delete', methods=['DELETE'])
 @jwt_required()
 def delete_item():

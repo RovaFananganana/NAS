@@ -508,7 +508,6 @@ def validate_file_endpoint(file_path):
 
 @file_bp.route('/<path:file_path>/smb-path', methods=['GET'])
 @jwt_required()
-@require_permission(resource="file", action="READ")
 def get_file_smb_path(file_path):
     """
     Get SMB path for opening file in local application
@@ -541,8 +540,8 @@ def get_file_smb_path(file_path):
         return jsonify({"error": f"Failed to get SMB path: {str(e)}"}), 500
 
 @file_bp.route('/temp-url', methods=['GET', 'POST'])
-@jwt_required()
-@require_permission(resource="file", action="READ")
+# @jwt_required()
+# @require_permission(resource="file", action="READ")
 def get_temp_file_url():
     """
     Generate a temporary URL for file access that can be used in window.open

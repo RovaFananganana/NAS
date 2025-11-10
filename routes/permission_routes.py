@@ -80,6 +80,7 @@ def get_all_resources():
             folders_data.append({
                 'id': f.id,
                 'name': f.name,
+                'path': getattr(f, 'path', None),
                 'permissions': permissions_data
             })
 
@@ -110,6 +111,7 @@ def get_all_resources():
             files_data.append({
                 'id': file.id,
                 'name': file.name,
+                'path': getattr(file, 'path', None),
                 'permissions': permissions_data
             })
 
