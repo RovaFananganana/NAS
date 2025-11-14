@@ -290,6 +290,49 @@ def delete_file(file_id):
         db.session.rollback()
         return jsonify({"msg": "Erreur lors de la suppression"}), 500
 
+def _update_file_sizes_from_nas(files):
+    """
+    Recalcule les tailles des fichiers à partir du NAS si elles sont manquantes.
+    Retourne le nombre de fichiers mis à jour.
+    """
+    updated_count = 0
+    try:
+        from routes.nas_routes import get_smb_client
+        smb_client = get_smb_client()
+        
+        for file in files:
+            if file.size_kb is None or file.size_kb == 0:
+                try:
+                    # Récupérer les infos du fichier depuis le NAS
+                    nas_path = file.path or file.file_path
+                    if nas_path:
+                        # Récupérer le parent path et le filename
+                        import os
+                        parent_path = os.path.dirname(nas_path) or '/'
+                        filename = os.path.basename(nas_path)
+                        
+                        # Lister le contenu du dossier parent
+                        items = smb_client.list_files(parent_path)
+                        for item in items:
+                            if item['name'] == filename and item['size'] and item['size'] > 0:
+                                # Mettre à jour la taille en KB
+                                file.size_kb = int(item['size'] / 1024) if item['size'] > 0 else 0
+                                db.session.add(file)
+                                updated_count += 1
+                                print(f"✏️  Updated {filename}: {file.size_kb} KB")
+                                break
+                except Exception as e:
+                    print(f"⚠️  Could not fetch NAS size for {file.name}: {str(e)}")
+        
+        if updated_count > 0:
+            db.session.commit()
+            print(f"💾 Committed {updated_count} file size updates")
+    except Exception as e:
+        print(f"❌ Error updating file sizes from NAS: {str(e)}")
+        db.session.rollback()
+    
+    return updated_count
+
 @user_bp.route('/storage-info', methods=['GET'])
 @jwt_required()
 def get_storage_info():
@@ -300,30 +343,61 @@ def get_storage_info():
     if not user:
         return jsonify({"msg": "Utilisateur non trouvé"}), 404
     
-    # Calculer l'espace utilisé
-    total_size_kb = db.session.query(db.func.sum(File.size_kb)).filter_by(owner_id=user.id).scalar() or 0
-    total_size_mb = round(total_size_kb / 1024, 2)
+    print(f"DEBUG: Getting storage info for user {user_id} ({user.username})")
     
-    # Statistiques par type de fichier (basé sur l'extension)
+    # Récupérer tous les fichiers de cet utilisateur
     files = File.query.filter_by(owner_id=user_id).all()
+    
+    # Si des fichiers ont size_kb = 0 ou NULL, recalculer depuis le NAS
+    files_with_zero_size = [f for f in files if f.size_kb is None or f.size_kb == 0]
+    if files_with_zero_size:
+        print(f"⚠️  Found {len(files_with_zero_size)} files with zero/null size, fetching from NAS...")
+        _update_file_sizes_from_nas(files_with_zero_size)
+        # Recharger les fichiers pour obtenir les nouvelles tailles
+        files = File.query.filter_by(owner_id=user_id).all()
+    
+    # Calculer l'espace utilisé par cet utilisateur (en bytes)
+    total_size_kb = db.session.query(db.func.sum(File.size_kb)).filter_by(owner_id=user_id).scalar() or 0
+    print(f"DEBUG: Total size KB from DB = {total_size_kb}")
+    
+    total_size_bytes = int(total_size_kb * 1024) if total_size_kb else 0
+    
+    # Quota de l'utilisateur en bytes
+    quota_bytes = int(user.quota_mb * 1024 * 1024) if user.quota_mb else 0
+    print(f"DEBUG: User quota MB = {user.quota_mb}, quota bytes = {quota_bytes}")
+    
+    file_count = len(files) if files else 0
+    print(f"DEBUG: File count = {file_count}")
+    
+    folder_count = Folder.query.filter_by(owner_id=user_id).count() if hasattr(Folder, 'owner_id') else 0
+    
     file_types = {}
     for file in files:
         ext = file.name.split('.')[-1].lower() if '.' in file.name else 'no_extension'
         if ext not in file_types:
-            file_types[ext] = {'count': 0, 'size_kb': 0}
+            file_types[ext] = {'count': 0, 'size_bytes': 0}
         file_types[ext]['count'] += 1
-        file_types[ext]['size_kb'] += file.size_kb
+        file_types[ext]['size_bytes'] += int(file.size_kb * 1024) if file.size_kb else 0
     
-    return jsonify({
-        'quota_mb': user.quota_mb,
-        'used_kb': total_size_kb,
-        'used_mb': total_size_mb,
-        'available_mb': max(0, user.quota_mb - total_size_mb),
-        'usage_percentage': round((total_size_mb / user.quota_mb * 100), 2) if user.quota_mb > 0 else 0,
-        'total_files': len(files),
-        'total_folders': Folder.query.filter_by(owner_id=user_id).count(),
+    # Total available (use quota as the limit)
+    total_bytes = quota_bytes
+    available_bytes = max(0, quota_bytes - total_size_bytes)
+    usage_percentage = round((total_size_bytes / quota_bytes * 100), 2) if quota_bytes > 0 else 0
+    
+    response = {
+        'used_bytes': total_size_bytes,
+        'total_bytes': total_bytes,
+        'quota_bytes': quota_bytes,
+        'available_bytes': available_bytes,
+        'usage_percentage': usage_percentage,
+        'files': file_count,
+        'folders': folder_count,
         'file_types': file_types
-    }), 200
+    }
+    
+    print(f"DEBUG: Returning storage info: {response}")
+    
+    return jsonify(response), 200
 
 @user_bp.route('/my-logs', methods=['GET'])
 @jwt_required()
