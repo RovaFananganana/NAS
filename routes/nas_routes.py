@@ -54,34 +54,25 @@ class GlobalSMBClient:
         
         self.conn = None
         self._is_connected = False
+        self._last_connect_attempt = None
         self._connect()
 
     def _connect(self):
         """Établit la connexion SMB une seule fois"""
         try:
+            import time
+            # Throttle des tentatives de connexion pour éviter les boucles rapides
+            if self._last_connect_attempt and (time.time() - self._last_connect_attempt) < 0.5:
+                print("⏱️ Reconnexion tentée trop rapidement, attente courte")
+                return False
+            self._last_connect_attempt = time.time()
+
             if self._is_connected and self.conn:
                 return True
             
             # Essayer différentes configurations SMB
+            # Tentative 1: TCP direct sur port 445 (préférer si possible)
             try:
-                # Configuration 1: NetBIOS sur port 139
-                self.conn = SMBConnection(
-                    self.username,
-                    self.password,
-                    self.client_name,
-                    self.server_name,
-                    domain=self.domain_name,
-                    use_ntlm_v2=True,
-                    is_direct_tcp=False
-                )
-                if self.conn.connect(self.server_ip, 139):
-                    print(f"✅ Connexion SMB NetBIOS réussie sur port 139")
-                    return True
-            except Exception as e1:
-                print(f"❌ Échec NetBIOS port 139: {str(e1)}")
-            
-            try:
-                # Configuration 2: TCP direct sur port 445
                 self.conn = SMBConnection(
                     self.username,
                     self.password,
@@ -96,9 +87,26 @@ class GlobalSMBClient:
                     return True
             except Exception as e2:
                 print(f"❌ Échec TCP direct port 445: {str(e2)}")
-            
+
+            # Tentative 2: NetBIOS sur port 139
             try:
-                # Configuration 3: NTLM v1 en fallback
+                self.conn = SMBConnection(
+                    self.username,
+                    self.password,
+                    self.client_name,
+                    self.server_name,
+                    domain=self.domain_name,
+                    use_ntlm_v2=True,
+                    is_direct_tcp=False
+                )
+                if self.conn.connect(self.server_ip, 139):
+                    print(f"✅ Connexion SMB NetBIOS réussie sur port 139")
+                    return True
+            except Exception as e1:
+                print(f"❌ Échec NetBIOS port 139: {str(e1)}")
+
+            # Tentative 3: NTLM v1 en fallback
+            try:
                 self.conn = SMBConnection(
                     self.username,
                     self.password,
@@ -130,9 +138,16 @@ class GlobalSMBClient:
 
     def _ensure_connected(self):
         """S'assure que la connexion est active, reconnecte si nécessaire"""
+        import time
+        # Avoid reconnect spamming during rapid requests (e.g. many OPTIONS from the frontend)
         if not self._is_connected or not self.conn:
+            # If we attempted a connect very recently, skip immediate reconnect (will be retried shortly)
+            if self._last_connect_attempt and (time.time() - self._last_connect_attempt) < 0.2:
+                # Quietly return false; caller should handle empty results gracefully
+                return False
             print("🔄 Reconnexion SMB nécessaire...")
-            self._connect()
+            return self._connect()
+        return True
 
     def list_files(self, path="/"):
         """Liste les fichiers et dossiers avec fallback"""
@@ -152,9 +167,16 @@ class GlobalSMBClient:
             return result
             
         except Exception as e:
+            err_msg = str(e).lower()
             print(f"❌ Erreur listage {path}: {str(e)}")
-            
-            # Essayer de reconnecter et relister
+
+            # Certains messages indiquent une incompatibilité/protocole ou un échec d'auth
+            # Dans ces cas, ne pas tenter une boucle de reconnexion immédiate: retourner []
+            if ('invalid 4-byte' in err_msg) or ('not authenticated' in err_msg) or ('not connected' in err_msg) or ('timed out' in err_msg):
+                print(f"⚠️ Erreur SMB non récupérable pour {path}, on saute ce dossier: {err_msg}")
+                return []
+
+            # Essayer de reconnecter et relister pour les autres erreurs
             try:
                 print("🔄 Tentative de reconnexion...")
                 self._is_connected = False
@@ -170,7 +192,9 @@ class GlobalSMBClient:
                 return result
             except Exception as e2:
                 print(f"❌ Échec de reconnexion: {str(e2)}")
-                raise Exception(f"Impossible de lister {path}: {str(e2)}")
+                # Ne pas échouer complètement la requête: retourner une liste vide
+                # pour permettre à la recherche récursive de continuer ailleurs.
+                return []
 
     def create_folder(self, path, folder_name):
         """Crée un dossier"""
@@ -2727,7 +2751,7 @@ def search_files():
         results = []
         visited_paths = set()
         search_start_time = datetime.now()
-        max_search_time = 2  # Maximum 2 secondes pour plus de réactivité
+        max_search_time = 8  # Maximum 8 secondes pour plus de réactivité (augmenté pour tolérer latence SMB)
         
         def search_in_directory(current_path, depth=0):
             """Recherche récursive dans un répertoire (optimisée)"""
