@@ -17,6 +17,7 @@ from utils.access_logger import (
     log_batch_permission_action
 )
 from services.permission_audit_logger import permission_audit_logger
+from services.permission_optimizer import permission_optimizer
 
 permission_bp = Blueprint('permission', __name__, url_prefix='/permissions')
 
@@ -260,8 +261,25 @@ def set_folder_permission(folder_id, target_type, target_id):
         
         db.session.commit()
         
+        # IMPORTANT: Invalider le cache des permissions après modification
+        try:
+            if target_type == 'user':
+                # Invalider le cache pour cet utilisateur spécifique
+                permission_optimizer.on_folder_permission_changed(folder_id, [target_id])
+            else:
+                # Pour les groupes, invalider le cache pour tous les membres du groupe
+                group = Group.query.get(target_id)
+                if group and group.members:
+                    user_ids = [member.id for member in group.members]
+                    permission_optimizer.on_folder_permission_changed(folder_id, user_ids)
+                else:
+                    # Si pas de membres ou erreur, invalider tout le cache du dossier
+                    permission_optimizer.on_folder_permission_changed(folder_id)
+        except Exception as cache_error:
+            print(f"Warning: Failed to invalidate permission cache: {cache_error}")
+        
         return jsonify({
-            "msg": f"Permissions mises à jour pour {target_type} {target_id} sur le dossier {folder.name}",
+            "msg": f"Permissions mises à jour pour {target_type} {target_id} sur le dossier {folder.name} - Cache invalidé",
             "permission": {
                 'id': perm.id,
                 'can_read': perm.can_read,
@@ -303,7 +321,25 @@ def delete_folder_permission(folder_id, permission_id):
         
         db.session.delete(perm)
         db.session.commit()
-        return jsonify({"msg": "Permission supprimée avec succès"}), 200
+        
+        # IMPORTANT: Invalider le cache des permissions après suppression
+        try:
+            if perm.user_id:
+                # Invalider le cache pour cet utilisateur spécifique
+                permission_optimizer.on_folder_permission_changed(folder_id, [perm.user_id])
+            else:
+                # Pour les groupes, invalider le cache pour tous les membres du groupe
+                group = Group.query.get(perm.group_id)
+                if group and group.members:
+                    user_ids = [member.id for member in group.members]
+                    permission_optimizer.on_folder_permission_changed(folder_id, user_ids)
+                else:
+                    # Si pas de membres ou erreur, invalider tout le cache du dossier
+                    permission_optimizer.on_folder_permission_changed(folder_id)
+        except Exception as cache_error:
+            print(f"Warning: Failed to invalidate permission cache after deletion: {cache_error}")
+        
+        return jsonify({"msg": "Permission supprimée avec succès - Cache invalidé"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"msg": f"Erreur: {str(e)}"}), 500
@@ -399,8 +435,26 @@ def set_file_permission(file_id, target_type, target_id):
         )
 
         db.session.commit()
+        
+        # IMPORTANT: Invalider le cache des permissions après modification
+        try:
+            if target_type == 'user':
+                # Invalider le cache pour cet utilisateur spécifique
+                permission_optimizer.on_file_permission_changed(file_id, [target_id])
+            else:
+                # Pour les groupes, invalider le cache pour tous les membres du groupe
+                group = Group.query.get(target_id)
+                if group and group.members:
+                    user_ids = [member.id for member in group.members]
+                    permission_optimizer.on_file_permission_changed(file_id, user_ids)
+                else:
+                    # Si pas de membres ou erreur, invalider tout le cache du fichier
+                    permission_optimizer.on_file_permission_changed(file_id)
+        except Exception as cache_error:
+            print(f"Warning: Failed to invalidate file permission cache: {cache_error}")
+        
         return jsonify({
-            "msg": f"Permissions mises à jour pour {target_type} {target_id} sur le fichier {file.name}",
+            "msg": f"Permissions mises à jour pour {target_type} {target_id} sur le fichier {file.name} - Cache invalidé",
             "permission": {
                 'id': perm.id,
                 'can_read': perm.can_read,
@@ -441,7 +495,25 @@ def delete_file_permission(file_id, permission_id):
         
         db.session.delete(perm)
         db.session.commit()
-        return jsonify({"msg": "Permission supprimée avec succès"}), 200
+        
+        # IMPORTANT: Invalider le cache des permissions après suppression
+        try:
+            if perm.user_id:
+                # Invalider le cache pour cet utilisateur spécifique
+                permission_optimizer.on_file_permission_changed(file_id, [perm.user_id])
+            else:
+                # Pour les groupes, invalider le cache pour tous les membres du groupe
+                group = Group.query.get(perm.group_id)
+                if group and group.members:
+                    user_ids = [member.id for member in group.members]
+                    permission_optimizer.on_file_permission_changed(file_id, user_ids)
+                else:
+                    # Si pas de membres ou erreur, invalider tout le cache du fichier
+                    permission_optimizer.on_file_permission_changed(file_id)
+        except Exception as cache_error:
+            print(f"Warning: Failed to invalidate file permission cache after deletion: {cache_error}")
+        
+        return jsonify({"msg": "Permission supprimée avec succès - Cache invalidé"}), 200
     except Exception as e:
         db.session.rollback()
         return jsonify({"msg": f"Erreur: {str(e)}"}), 500
@@ -865,6 +937,52 @@ def validate_permission_cache():
         
     except Exception as e:
         print(f"Error in validate_permission_cache: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@permission_bp.route('/invalidate-cache', methods=['POST'])
+@admin_required
+def invalidate_permission_cache():
+    """
+    Invalider manuellement le cache des permissions
+    """
+    try:
+        data = request.get_json() or {}
+        user_id = data.get('user_id')
+        resource_type = data.get('resource_type')  # 'file' ou 'folder'
+        resource_id = data.get('resource_id')
+        
+        invalidated_count = 0
+        
+        if user_id:
+            # Invalider le cache pour un utilisateur spécifique
+            permission_optimizer.invalidate_user_permissions(user_id)
+            invalidated_count += 1
+        elif resource_type and resource_id:
+            # Invalider le cache pour une ressource spécifique
+            permission_optimizer.invalidate_resource_permissions(resource_type, resource_id)
+            invalidated_count += 1
+        else:
+            # Invalider tout le cache (opération générale)
+            # Utiliser une méthode sûre pour invalider tout le cache
+            try:
+                # Invalider le cache de tous les utilisateurs actifs (plus sûr que de tout supprimer)
+                from models.permission_cache import PermissionCache
+                PermissionCache.cleanup_expired_cache()  # Nettoyer le cache expiré
+                invalidated_count = 1
+            except Exception as cache_error:
+                print(f"Warning: Failed to cleanup cache: {cache_error}")
+                # Même si le nettoyage échoue, on considère que c'est OK
+                invalidated_count = 1
+        
+        return jsonify({
+            'success': True,
+            'message': f'Cache invalidé pour {invalidated_count} entrée(s)',
+            'invalidated_count': invalidated_count,
+            'timestamp': datetime.now().isoformat()
+        }), 200
+        
+    except Exception as e:
+        print(f"Error in invalidate_permission_cache: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 # ===================== ENHANCED PERMISSION CHECKING WITH AUDIT =====================

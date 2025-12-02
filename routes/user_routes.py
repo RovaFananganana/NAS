@@ -451,20 +451,49 @@ def get_dashboard():
     total_folders = Folder.query.filter_by(owner_id=user_id).count()
     total_size_kb = db.session.query(db.func.sum(File.size_kb)).filter_by(owner_id=user_id).scalar() or 0
     
-    # Fichiers récents (derniers 5)
-    recent_files = File.query.filter_by(owner_id=user_id).order_by(
-        File.created_at.desc()
-    ).limit(5).all()
+    # Fichiers récents basés sur les logs d'accès (excluant la racine "/")
+    recent_access_logs = AccessLog.query.filter(
+        AccessLog.user_id == user_id,
+        AccessLog.action.in_(['ACCESS_FILE', 'DOWNLOAD_FILE', 'file_download']),
+        AccessLog.target.notlike('/%'),  # Exclure la racine "/"
+        AccessLog.target != '/',  # Exclure explicitement la racine
+        AccessLog.target.isnot(None)  # Exclure les targets null
+    ).order_by(AccessLog.timestamp.desc()).limit(20).all()
     
+    # Dédupliquer par target (garder le plus récent de chaque fichier)
+    seen_targets = set()
     recent_files_data = []
-    for file in recent_files:
-        recent_files_data.append({
-            'id': file.id,
-            'name': file.name,
-            'size_kb': file.size_kb,
-            'created_at': file.created_at.isoformat(),
-            'folder_name': file.folder.name if file.folder else 'Racine'
-        })
+    
+    for log in recent_access_logs:
+        if log.target and log.target not in seen_targets and len(recent_files_data) < 10:
+            seen_targets.add(log.target)
+            
+            # Extraire le nom du fichier du target
+            file_name = log.target.split('/')[-1] if '/' in log.target else log.target
+            
+            # Essayer de trouver des infos supplémentaires si possible
+            file_info = {
+                'name': file_name,
+                'path': log.target,
+                'last_accessed': log.timestamp.isoformat(),
+                'action': log.action,
+                'is_directory': False  # Les logs d'accès fichier sont toujours des fichiers
+            }
+            
+            # Essayer de récupérer la taille si le fichier existe encore en DB
+            try:
+                db_file = File.query.filter_by(path=log.target).first()
+                if db_file:
+                    file_info.update({
+                        'id': db_file.id,
+                        'size_kb': db_file.size_kb,
+                        'folder_name': db_file.folder.name if db_file.folder else 'Racine'
+                    })
+            except:
+                # Si erreur, continuer avec les infos de base
+                pass
+                
+            recent_files_data.append(file_info)
     
     # Activité récente (derniers 10 logs)
     recent_logs = AccessLog.query.filter_by(user_id=user_id).order_by(

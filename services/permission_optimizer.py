@@ -1078,3 +1078,5 @@ class PermissionOptimizer:
             'max_depth': 0,
             'folders_by_level': {}
         }
+# Create a global instance of the permission optimizer
+permission_optimizer = PermissionOptimizer()
