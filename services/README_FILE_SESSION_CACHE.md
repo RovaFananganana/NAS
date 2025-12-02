@@ -85,12 +85,7 @@ cache_service = FileCacheService(
 
 ## Testing
 
-Run the test suite:
-
-```bash
-cd backend
-python test_file_cache_service.py
-```
+The file cache service can be tested through the main application or by creating unit tests in the tests directory.
 
 ## Next Steps
 
